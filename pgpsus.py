@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""PGPsus v1.5 - PGP / PQC signing and encryption TUI."""
-VERSION = "1.5"
+"""PGPsus v1.6 - PGP / PQC signing and encryption TUI."""
+VERSION = "1.6"
 
 import gnupg, os, re, base64, json, subprocess, shutil
 import time as _time
@@ -116,11 +116,10 @@ CSS = """
 Screen { background: $background; color: $foreground; }
 
 #theme-bar {
-    height: 3;
+    height: 5;
     background: #1a1a1a;
     border-bottom: solid #333333;
     padding: 0 1;
-    align: left middle;
 }
 #theme-bar.light {
     background: #e8e8e0;
@@ -130,20 +129,22 @@ Screen { background: $background; color: $foreground; }
     background: #ddf0fb;
     border-bottom: solid #90c8e8;
 }
+#theme-bar-row1 { height: 3; align: left middle; }
+#theme-bar-row2 { height: 2; align: left middle; }
 #theme-bar Label { color: #888888; margin-right: 1; }
 #theme-bar.light Label { color: #555555; }
 #theme-bar.heavenly Label { color: #2a8fd4; }
 #theme-bar.infernal Label { color: #c84a1a; }
-#theme-btn-dark     { width: 8; background: #3a8a3a; color: #ffffff; border: none; margin-right: 1; }
-#theme-btn-light    { width: 8; background: #2a2a2a; color: #aaaaaa; border: none; margin-right: 1; }
-#theme-btn-heavenly { width: 8; background: #e0f0fa; color: #2a8fd4; border: none; margin-right: 1; }
-#theme-btn-infernal { width: 8; background: #220b00; color: #c84a1a; border: none; margin-right: 1; }
-#theme-btn-dark:hover     { background: #4a9a4a; }
-#theme-btn-light:hover    { background: #3a3a3a; }
-#theme-btn-heavenly:hover { background: #c0e4f8; }
-#theme-btn-infernal:hover { background: #330e00; }
+#theme-btn-dark     { width: 8; background: #444444; color: #cccccc; border: none; margin-right: 1; }
+#theme-btn-light    { width: 8; background: #444444; color: #cccccc; border: none; margin-right: 1; }
+#theme-btn-heavenly { width: 8; background: #444444; color: #cccccc; border: none; margin-right: 1; }
+#theme-btn-infernal { width: 8; background: #444444; color: #cccccc; border: none; margin-right: 1; }
+#theme-btn-dark:hover     { background: #555555; }
+#theme-btn-light:hover    { background: #555555; }
+#theme-btn-heavenly:hover { background: #555555; }
+#theme-btn-infernal:hover { background: #555555; }
 .swatch { width: 3; height: 1; margin: 0 0 0 1; }
-#utc-clock { margin-left: 2; color: #888888; }
+#utc-clock { color: #888888; }
 #theme-bar.light #utc-clock { color: #555555; }
 #theme-bar.heavenly #utc-clock { color: #2a8fd4; }
 #theme-bar.infernal #utc-clock { color: #c84a1a; }
@@ -246,15 +247,17 @@ class PGPsus(App):
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
-        with Horizontal(id="theme-bar"):
-            yield Label("Theme:")
-            yield Button("Dark",     id="theme-btn-dark")
-            yield Button("Light",    id="theme-btn-light")
-            yield Button("Heavenly", id="theme-btn-heavenly")
-            yield Button("Infernal", id="theme-btn-infernal")
-            for i, (color, lbl) in enumerate(zip(SWATCHES["dark"], SWATCH_LABELS)):
-                yield Static(" ", id=f"sw{i}", classes="swatch")
-            yield Label("", id="utc-clock", classes="utc-clock")
+        with Vertical(id="theme-bar"):
+            with Horizontal(id="theme-bar-row1"):
+                yield Label("Theme:")
+                yield Button("Dark",     id="theme-btn-dark")
+                yield Button("Light",    id="theme-btn-light")
+                yield Button("Heavenly", id="theme-btn-heavenly")
+                yield Button("Infernal", id="theme-btn-infernal")
+                for i, (color, lbl) in enumerate(zip(SWATCHES["dark"], SWATCH_LABELS)):
+                    yield Static(" ", id=f"sw{i}", classes="swatch")
+            with Horizontal(id="theme-bar-row2"):
+                yield Label("", id="utc-clock", classes="utc-clock")
         with TabbedContent(id="tabs"):
             with TabPane("Encrypt",     id="tab-enc"):  yield self._enc_merged_pane()
             with TabPane("Decrypt",     id="tab-dec"):  yield self._dec_merged_pane()
@@ -287,8 +290,8 @@ class PGPsus(App):
             sw.styles.background = color
             sw.tooltip = lbl
 
-    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#3a8a3a", "heavenly": "#2a8fd4", "infernal": "#c84a1a"}
-    _THEME_INACTIVE = {"dark": "#2a2a2a", "light": "#2a2a2a", "heavenly": "#e0f0fa", "infernal": "#220b00"}
+    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#2a7abf", "heavenly": "#2a8fd4", "infernal": "#c84a1a"}
+    _THEME_INACTIVE = {"dark": "#444444", "light": "#444444", "heavenly": "#444444", "infernal": "#444444"}
     _THEME_CLASSES  = {"dark": set(),     "light": {"light"},  "heavenly": {"heavenly"}, "infernal": {"infernal"}}
 
     def _switch_theme(self, theme_name: str):
