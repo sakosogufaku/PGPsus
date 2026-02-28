@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""PGPsus v1.3 - PGP / PQC signing and encryption TUI."""
-VERSION = "1.3"
+"""PGPsus v1.4 - PGP / PQC signing and encryption TUI."""
+VERSION = "1.4"
 
 import gnupg, os, re, base64, json, subprocess, shutil
 import time as _time
@@ -88,11 +88,11 @@ THEMES = {
     ),
     "heavenly": Theme(
         name="heavenly",
-        primary="#7aa8d8", secondary="#a0c8f0",
-        background="#0a0f1e", surface="#0f1830",
-        panel="#141f3a", foreground="#dde8f8",
-        success="#7ac8a0", warning="#c8c07a", error="#c87a7a",
-        dark=True,
+        primary="#2a8fd4", secondary="#5ab8f0",
+        background="#f0f8ff", surface="#ffffff",
+        panel="#e0f0fa", foreground="#1a2a3a",
+        success="#2a9a5a", warning="#c07a00", error="#cc2a2a",
+        dark=False,
     ),
     "infernal": Theme(
         name="infernal",
@@ -107,7 +107,7 @@ THEMES = {
 SWATCHES = {
     "dark":     ["#0d0d0d","#111111","#3a8a3a","#e8e8e8","#a8e8a8"],
     "light":    ["#f5f5f0","#ffffff","#1a7a1a","#1a1a1a","#1a4a1a"],
-    "heavenly": ["#0a0f1e","#0f1830","#7aa8d8","#dde8f8","#a0c8f0"],
+    "heavenly": ["#f0f8ff","#ffffff","#2a8fd4","#1a2a3a","#5ab8f0"],
     "infernal": ["#0d0500","#1a0800","#c84a1a","#f0c880","#ff8040"],
 }
 SWATCH_LABELS = ["bg","surface","primary","text","output"]
@@ -128,20 +128,20 @@ Screen { background: $background; color: $foreground; }
 }
 #theme-bar Label { color: #888888; margin-right: 1; }
 #theme-bar.light Label { color: #555555; }
-#theme-bar.heavenly Label { color: #7aa8d8; }
+#theme-bar.heavenly Label { color: #2a8fd4; }
 #theme-bar.infernal Label { color: #c84a1a; }
 #theme-btn-dark     { width: 8; background: #3a8a3a; color: #ffffff; border: none; margin-right: 1; }
 #theme-btn-light    { width: 8; background: #2a2a2a; color: #aaaaaa; border: none; margin-right: 1; }
-#theme-btn-heavenly { width: 8; background: #0a0f1e; color: #7aa8d8; border: none; margin-right: 1; }
+#theme-btn-heavenly { width: 8; background: #e0f0fa; color: #2a8fd4; border: none; margin-right: 1; }
 #theme-btn-infernal { width: 8; background: #220b00; color: #c84a1a; border: none; margin-right: 1; }
 #theme-btn-dark:hover     { background: #4a9a4a; }
 #theme-btn-light:hover    { background: #3a3a3a; }
-#theme-btn-heavenly:hover { background: #141f3a; }
+#theme-btn-heavenly:hover { background: #c0e4f8; }
 #theme-btn-infernal:hover { background: #330e00; }
 .swatch { width: 3; height: 1; margin: 0 0 0 1; }
 #utc-clock { margin-left: 2; color: #888888; }
 #theme-bar.light #utc-clock { color: #555555; }
-#theme-bar.heavenly #utc-clock { color: #7aa8d8; }
+#theme-bar.heavenly #utc-clock { color: #2a8fd4; }
 #theme-bar.infernal #utc-clock { color: #c84a1a; }
 
 #sidebar {
@@ -283,8 +283,8 @@ class PGPsus(App):
             sw.styles.background = color
             sw.tooltip = lbl
 
-    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#3a8a3a", "heavenly": "#7aa8d8", "infernal": "#c84a1a"}
-    _THEME_INACTIVE = {"dark": "#2a2a2a", "light": "#2a2a2a", "heavenly": "#0a0f1e", "infernal": "#220b00"}
+    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#3a8a3a", "heavenly": "#2a8fd4", "infernal": "#c84a1a"}
+    _THEME_INACTIVE = {"dark": "#2a2a2a", "light": "#2a2a2a", "heavenly": "#e0f0fa", "infernal": "#220b00"}
     _THEME_CLASSES  = {"dark": set(),     "light": {"light"},  "heavenly": {"heavenly"}, "infernal": {"infernal"}}
 
     def _switch_theme(self, theme_name: str):
