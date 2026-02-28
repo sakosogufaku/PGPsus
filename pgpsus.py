@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""PGPsus v1.6 - PGP / PQC signing and encryption TUI."""
-VERSION = "1.6"
+"""PGPsus v1.7 - PGP / PQC signing and encryption TUI."""
+VERSION = "1.7"
 
 import gnupg, os, re, base64, json, subprocess, shutil
 import time as _time
@@ -290,7 +290,7 @@ class PGPsus(App):
             sw.styles.background = color
             sw.tooltip = lbl
 
-    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#2a7abf", "heavenly": "#2a8fd4", "infernal": "#c84a1a"}
+    _THEME_ACTIVE   = {"dark": "#3a8a3a", "light": "#3a9a3a", "heavenly": "#2a8fd4", "infernal": "#c84a1a"}
     _THEME_INACTIVE = {"dark": "#444444", "light": "#444444", "heavenly": "#444444", "infernal": "#444444"}
     _THEME_CLASSES  = {"dark": set(),     "light": {"light"},  "heavenly": {"heavenly"}, "infernal": {"infernal"}}
 
