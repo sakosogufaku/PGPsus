@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pgpsus — launcher for PGPsus
+# Auto-runs setup on first use, then launches the TUI via local venv.
+#
+# Usage:
+#   ./pgp                          launch with default GPG home (~/.gnupg)
+#   ./pgp --gpghome /path/.gnupg   use a different GPG home (e.g. on Whonix)
+#   ./pgp --setup                  force re-run setup (reinstall deps)
+
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV="$DIR/venv"
+PYTHON="$VENV/bin/python"
+
+# Parse --gpghome and --setup flags
+GPGHOME=""
+FORCE_SETUP=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --gpghome) GPGHOME="$2"; shift 2 ;;
+        --setup)   FORCE_SETUP=1; shift ;;
+        *) break ;;
+    esac
+done
+
+# Auto-setup if venv missing or --setup passed
+if [ ! -f "$PYTHON" ] || [ "$FORCE_SETUP" = "1" ]; then
+    bash "$DIR/setup.sh"
+fi
+
+# Verify deps are importable (catches partial installs)
+if ! "$PYTHON" -c "import textual, gnupg, pqcrypto, cryptography" 2>/dev/null; then
+    echo "[PGPsus] Dependency check failed — re-running setup..."
+    bash "$DIR/setup.sh"
+fi
+
+# Launch
+[ -n "$GPGHOME" ] && export GNUPGHOME="$GPGHOME"
+exec "$PYTHON" "$DIR/pgpsus.py" "$@"
