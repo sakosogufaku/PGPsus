@@ -1,11 +1,12 @@
 # PGPsus 🔐
 
-**Alpha release** — A terminal TUI for PGP, Age, and post-quantum hybrid encryption.
+**Alpha release** — A free and open source terminal TUI for PGP, Age, and post-quantum hybrid encryption.
 
 Built with [Textual](https://github.com/Textualize/textual). No Electron, no browser, no nonsense.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
+![FOSS](https://img.shields.io/badge/FOSS-MIT-brightgreen)
 ![Status](https://img.shields.io/badge/status-alpha-orange)
 
 ---
