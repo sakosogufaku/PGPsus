@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""PGPsus — PGP / Age / PQC Hybrid encryption TUI — Textual 8, GPG keyring auto-detected."""
+"""PGPsus v1.2 - PGP / PQC signing and encryption TUI."""
+VERSION = "1.2"
 
-VERSION = "1.1"
 import gnupg, os, re, base64, json, subprocess, shutil
+import time as _time
+os.environ["TZ"] = "UTC"
+_time.tzset()
+import pqsign_crypto
 from pathlib import Path
 from textual.app import App, ComposeResult
-from textual.binding import Binding
 from textual.theme import Theme
 from textual.widgets import (
     Header, Footer, TabbedContent, TabPane,
@@ -20,12 +23,6 @@ import hybrid_crypto
 
 def _clipboard_paste() -> str:
     """Read clipboard text using whatever tool is available."""
-    import os
-    env = os.environ.copy()
-    # Ensure DISPLAY is set — required for X11 clipboard tools running as subprocesses
-    if "DISPLAY" not in env:
-        env["DISPLAY"] = ":0"
-
     for cmd in (
         ["wl-paste", "--no-newline"],
         ["xclip", "-selection", "clipboard", "-o"],
@@ -34,19 +31,9 @@ def _clipboard_paste() -> str:
     ):
         if shutil.which(cmd[0]):
             try:
-                return subprocess.check_output(cmd, timeout=2, env=env).decode()
+                return subprocess.check_output(cmd, timeout=2).decode()
             except Exception:
                 pass
-    # Tkinter fallback — works on any X11 system with python3-tk
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
-        text = root.clipboard_get()
-        root.destroy()
-        return text
-    except Exception:
-        pass
     return ""
 
 
@@ -63,22 +50,9 @@ def _clipboard_copy(text: str) -> bool:
                 return True
             except Exception:
                 pass
-    # Tkinter fallback
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.withdraw()
-        root.clipboard_clear()
-        root.clipboard_append(text)
-        root.update()
-        root.after(200, root.destroy)
-        root.mainloop()
-        return True
-    except Exception:
-        pass
     return False
 
-# ── GPG setup ─────────────────────────────────────────────────────────────────
+# -- GPG setup -----------------------------------------------------------------
 GPG_HOME = os.environ.get("GNUPGHOME", str(Path.home() / ".gnupg"))
 gpg = gnupg.GPG(gnupghome=GPG_HOME)
 gpg.encoding = "utf-8"
@@ -94,7 +68,7 @@ def gpg_pub_keys():
 def gpg_sec_keys():
     return [(k["uids"][0] if k["uids"] else k["keyid"], k["fingerprint"]) for k in gpg.list_keys(True)]
 
-# ── Themes ────────────────────────────────────────────────────────────────────
+# -- Themes --------------------------------------------------------------------
 THEMES = {
     "dark": Theme(
         name="dark",
@@ -112,29 +86,11 @@ THEMES = {
         success="#1a7a1a", warning="#8a6a00", error="#9a1a1a",
         dark=False,
     ),
-    "heavenly": Theme(
-        name="heavenly",
-        primary="#4a9edd",   secondary="#a0c8f0",
-        background="#ddeeff", surface="#eef6ff",
-        panel="#c8e4f8",     foreground="#0a1a2e",
-        success="#2a8abf", warning="#b07820", error="#c03030",
-        dark=False,
-    ),
-    "infernal": Theme(
-        name="infernal",
-        primary="#dd4a1a",   secondary="#ff8c00",
-        background="#0d0000", surface="#1a0500",
-        panel="#2a0800",     foreground="#ffcc99",
-        success="#cc6600", warning="#ff8c00", error="#ff2200",
-        dark=True,
-    ),
 }
 
 SWATCHES = {
-    "dark":     ["#0d0d0d","#111111","#3a8a3a","#e8e8e8","#a8e8a8"],
-    "light":    ["#f5f5f0","#ffffff","#1a7a1a","#1a1a1a","#1a4a1a"],
-    "heavenly": ["#ddeeff","#eef6ff","#4a9edd","#0a1a2e","#2a8abf"],
-    "infernal": ["#0d0000","#1a0500","#dd4a1a","#ffcc99","#cc6600"],
+    "dark":  ["#0d0d0d","#111111","#3a8a3a","#e8e8e8","#a8e8a8"],
+    "light": ["#f5f5f0","#ffffff","#1a7a1a","#1a1a1a","#1a4a1a"],
 }
 SWATCH_LABELS = ["bg","surface","primary","text","output"]
 
@@ -152,26 +108,15 @@ Screen { background: $background; color: $foreground; }
     background: #e8e8e0;
     border-bottom: solid #cccccc;
 }
-#theme-bar.heavenly {
-    background: #c8e4f8;
-    border-bottom: solid #7ab8e8;
-}
-#theme-bar.infernal {
-    background: #2a0800;
-    border-bottom: solid #8b2000;
-}
 #theme-bar Label { color: #888888; margin-right: 1; }
 #theme-bar.light Label { color: #555555; }
-#theme-bar.heavenly Label { color: #1a4a6a; }
-#theme-btn-dark     { min-width: 10; background: #3a8a3a; color: #ffffff; border: none; margin-right: 1; }
-#theme-btn-light    { min-width: 10; background: #2a2a2a; color: #aaaaaa; border: none; margin-right: 1; }
-#theme-btn-heavenly { min-width: 12; background: #4a9edd; color: #ffffff; border: none; margin-right: 1; }
-#theme-btn-infernal { min-width: 12; background: #dd4a1a; color: #ffcc99; border: none; margin-right: 1; }
-#theme-btn-dark:hover     { background: #4a9a4a; }
-#theme-btn-light:hover    { background: #3a3a3a; }
-#theme-btn-heavenly:hover { background: #5ab0ef; }
-#theme-btn-infernal:hover { background: #ee5a2a; }
+#theme-btn-dark  { width: 8; background: #3a8a3a; color: #ffffff; border: none; margin-right: 1; }
+#theme-btn-light { width: 8; background: #2a2a2a; color: #aaaaaa; border: none; margin-right: 1; }
+#theme-btn-dark:hover  { background: #4a9a4a; }
+#theme-btn-light:hover { background: #3a3a3a; }
 .swatch { width: 3; height: 1; margin: 0 0 0 1; }
+#utc-clock { margin-left: 2; color: #888888; }
+#theme-bar.light #utc-clock { color: #555555; }
 
 #sidebar {
     width: 32;
@@ -218,20 +163,17 @@ TextArea {
 
 class PGPsus(App):
     CSS = CSS
-    TITLE = f"PGPsus v{VERSION}"
+    TITLE = "PGPsus"
     BINDINGS = [
         ("ctrl+q", "quit",            "Quit"),
         ("ctrl+e", "tab('tab-enc')",  "Encrypt"),
         ("ctrl+d", "tab('tab-dec')",  "Decrypt"),
         ("ctrl+s", "tab('tab-sign')", "Sign"),
+        ("ctrl+q", "tab('tab-pqcsign')", "PQC Sign"),
         ("ctrl+k", "tab('tab-keys')", "Keys"),
         ("ctrl+f", "tab('tab-file')", "File"),
-        Binding("ctrl+v",       "paste", "Paste", priority=True),
-        Binding("ctrl+shift+v", "paste", "Paste", priority=True),
-        Binding("f2",           "paste", "Paste", priority=True),
-        Binding("ctrl+c",       "copy",  "Copy",  priority=True),
-        Binding("ctrl+y",       "copy",  "Copy",  priority=True),
-        Binding("f3",           "copy",  "Copy",  priority=True),
+        ("ctrl+v", "paste",           "Paste"),
+        ("ctrl+y", "copy",            "Copy"),
     ]
 
     def _insert_text(self, text: str) -> None:
@@ -245,27 +187,17 @@ class PGPsus(App):
             w.cursor_position = pos + len(text)
 
     def on_paste(self, event: Paste) -> None:
-        """Handle terminal bracketed paste. Falls back to xclip if text empty (Whonix safe-paste dialog strips it)."""
+        """Handle terminal bracketed paste (Ctrl+Shift+V in most terminals)."""
         event.stop()
-        text = event.text if event.text else _clipboard_paste()
-        self._insert_text(text)
+        self._insert_text(event.text)
 
     def action_paste(self) -> None:
-        """Ctrl+V / Ctrl+Shift+V: read from system clipboard and insert into focused widget."""
-        import os
+        """Ctrl+V: read from system clipboard and insert into focused widget."""
         text = _clipboard_paste()
-        # Diagnostic notification — shows exactly what happened so paste issues can be traced
-        focused_type = type(self.focused).__name__
-        display = os.environ.get("DISPLAY", "unset")
         if text:
             self._insert_text(text)
-            self.notify(f"Pasted {len(text)} chars into {focused_type}", timeout=2)
         else:
-            self.notify(
-                f"Clipboard empty — DISPLAY={display}, focused={focused_type}. "
-                f"Run: xclip -selection clipboard -o",
-                severity="warning", timeout=6
-            )
+            self.notify("No clipboard tool found (install xclip or wl-clipboard)", severity="warning")
 
     def action_copy(self) -> None:
         """Ctrl+Y: copy focused TextArea content (or selection) to clipboard."""
@@ -283,21 +215,21 @@ class PGPsus(App):
             self.notify("No clipboard tool found (install xclip or wl-clipboard)", severity="warning")
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=False)
         with Horizontal(id="theme-bar"):
             yield Label("Theme:")
-            yield Button("🌑 Dark",    id="theme-btn-dark")
-            yield Button("☀️  Light",  id="theme-btn-light")
-            yield Button("☁️  Heavenly", id="theme-btn-heavenly")
-            yield Button("🔥 Infernal",  id="theme-btn-infernal")
+            yield Button("Dark",   id="theme-btn-dark")
+            yield Button("Light", id="theme-btn-light")
             for i, (color, lbl) in enumerate(zip(SWATCHES["dark"], SWATCH_LABELS)):
                 yield Static(" ", id=f"sw{i}", classes="swatch")
+            yield Label("", id="utc-clock", classes="utc-clock")
         with TabbedContent(id="tabs"):
-            with TabPane("🔒 Encrypt",     id="tab-enc"):  yield self._enc_merged_pane()
-            with TabPane("🔓 Decrypt",     id="tab-dec"):  yield self._dec_merged_pane()
-            with TabPane("✍️ Sign/Verify", id="tab-sign"): yield self._sign_verify_pane()
-            with TabPane("🗝 Keys",        id="tab-keys"): yield self._keys_merged_pane()
-            with TabPane("📁 File",        id="tab-file"): yield self._file_pane()
+            with TabPane("Encrypt",     id="tab-enc"):  yield self._enc_merged_pane()
+            with TabPane("Decrypt",     id="tab-dec"):  yield self._dec_merged_pane()
+            with TabPane("Sign/Verify", id="tab-sign"):    yield self._sign_verify_pane()
+            with TabPane("PQC Sign",    id="tab-pqcsign"): yield self._pqcsign_pane()
+            with TabPane("Keys",        id="tab-keys"):    yield self._keys_merged_pane()
+            with TabPane("File",        id="tab-file"): yield self._file_pane()
         yield Label("Ready", id="status-bar")
         yield Footer()
 
@@ -306,8 +238,15 @@ class PGPsus(App):
             self.register_theme(theme)
         self.theme = "dark"
         self._apply_swatches("dark")
+        self.set_interval(1.0, self._update_utc_clock)
+        self._update_utc_clock()
 
-    # ── Theme bar ─────────────────────────────────────────────────────────────
+    def _update_utc_clock(self):
+        import datetime
+        now = datetime.datetime.utcnow()
+        self.query_one("#utc-clock", Label).update(now.strftime("%Y-%m-%d %H:%M:%S UTC"))
+
+    # -- Theme bar -------------------------------------------------------------
     def _apply_swatches(self, theme_name: str):
         colors = SWATCHES[theme_name]
         labels = SWATCH_LABELS
@@ -320,67 +259,25 @@ class PGPsus(App):
     def theme_dark(self):
         self.theme = "dark"
         self._apply_swatches("dark")
-        bar = self.query_one("#theme-bar")
-        bar.remove_class("light"); bar.remove_class("heavenly"); bar.remove_class("infernal")
-        self.query_one("#theme-btn-dark").styles.background     = "#3a8a3a"
-        self.query_one("#theme-btn-dark").styles.color          = "#ffffff"
-        self.query_one("#theme-btn-light").styles.background    = "#2a2a2a"
-        self.query_one("#theme-btn-light").styles.color         = "#aaaaaa"
-        self.query_one("#theme-btn-heavenly").styles.background = "#4a9edd"
-        self.query_one("#theme-btn-heavenly").styles.color      = "#ffffff"
-        self.query_one("#theme-btn-infernal").styles.background = "#dd4a1a"
-        self.query_one("#theme-btn-infernal").styles.color      = "#ffcc99"
+        self.query_one("#theme-bar").remove_class("light")
+        self.query_one("#theme-btn-dark").styles.background  = "#3a8a3a"
+        self.query_one("#theme-btn-dark").styles.color       = "#ffffff"
+        self.query_one("#theme-btn-light").styles.background = "#2a2a2a"
+        self.query_one("#theme-btn-light").styles.color      = "#aaaaaa"
         self.set_status("Theme: dark")
 
     @on(Button.Pressed, "#theme-btn-light")
     def theme_light(self):
         self.theme = "light"
         self._apply_swatches("light")
-        bar = self.query_one("#theme-bar")
-        bar.remove_class("heavenly"); bar.remove_class("infernal"); bar.add_class("light")
-        self.query_one("#theme-btn-light").styles.background    = "#3a8a3a"
-        self.query_one("#theme-btn-light").styles.color         = "#ffffff"
-        self.query_one("#theme-btn-dark").styles.background     = "#2a2a2a"
-        self.query_one("#theme-btn-dark").styles.color          = "#aaaaaa"
-        self.query_one("#theme-btn-heavenly").styles.background = "#4a9edd"
-        self.query_one("#theme-btn-heavenly").styles.color      = "#ffffff"
-        self.query_one("#theme-btn-infernal").styles.background = "#dd4a1a"
-        self.query_one("#theme-btn-infernal").styles.color      = "#ffcc99"
+        self.query_one("#theme-bar").add_class("light")
+        self.query_one("#theme-btn-light").styles.background = "#3a8a3a"
+        self.query_one("#theme-btn-light").styles.color      = "#ffffff"
+        self.query_one("#theme-btn-dark").styles.background  = "#2a2a2a"
+        self.query_one("#theme-btn-dark").styles.color       = "#aaaaaa"
         self.set_status("Theme: light")
 
-    @on(Button.Pressed, "#theme-btn-heavenly")
-    def theme_heavenly(self):
-        self.theme = "heavenly"
-        self._apply_swatches("heavenly")
-        bar = self.query_one("#theme-bar")
-        bar.remove_class("light"); bar.remove_class("infernal"); bar.add_class("heavenly")
-        self.query_one("#theme-btn-heavenly").styles.background = "#2a6a9a"
-        self.query_one("#theme-btn-heavenly").styles.color      = "#ffffff"
-        self.query_one("#theme-btn-dark").styles.background     = "#2a2a2a"
-        self.query_one("#theme-btn-dark").styles.color          = "#aaaaaa"
-        self.query_one("#theme-btn-light").styles.background    = "#a0c0d8"
-        self.query_one("#theme-btn-light").styles.color         = "#1a1a1a"
-        self.query_one("#theme-btn-infernal").styles.background = "#dd4a1a"
-        self.query_one("#theme-btn-infernal").styles.color      = "#ffcc99"
-        self.set_status("Theme: heavenly")
-
-    @on(Button.Pressed, "#theme-btn-infernal")
-    def theme_infernal(self):
-        self.theme = "infernal"
-        self._apply_swatches("infernal")
-        bar = self.query_one("#theme-bar")
-        bar.remove_class("light"); bar.remove_class("heavenly"); bar.add_class("infernal")
-        self.query_one("#theme-btn-infernal").styles.background = "#8b2000"
-        self.query_one("#theme-btn-infernal").styles.color      = "#ffcc99"
-        self.query_one("#theme-btn-dark").styles.background     = "#1a0500"
-        self.query_one("#theme-btn-dark").styles.color          = "#884433"
-        self.query_one("#theme-btn-light").styles.background    = "#1a0500"
-        self.query_one("#theme-btn-light").styles.color         = "#884433"
-        self.query_one("#theme-btn-heavenly").styles.background = "#1a0500"
-        self.query_one("#theme-btn-heavenly").styles.color      = "#884433"
-        self.set_status("Theme: infernal")
-
-    # ── PGP Encrypt pane ──────────────────────────────────────────────────────
+    # -- PGP Encrypt pane ------------------------------------------------------
     def _enc_pane(self):
         pub = gpg_pub_keys()
         sec = gpg_sec_keys()
@@ -392,8 +289,8 @@ class PGPsus(App):
                 Label("Sign with (optional):"),
                 Select([("(none)","")] + [(uid,fp) for uid,fp in sec], id="enc-signer", allow_blank=False),
                 Label("Passphrase (signing):"), Input(password=True, id="enc-pass"),
-                Button("🔒 Encrypt", id="btn-enc", variant="success"),
-                Button("🗑 Clear",   id="btn-enc-clr", variant="default"),
+                Button("Encrypt", id="btn-enc", variant="success"),
+                Button("Clear",   id="btn-enc-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -403,7 +300,7 @@ class PGPsus(App):
             ),
         )
 
-    # ── PGP Decrypt pane ──────────────────────────────────────────────────────
+    # -- PGP Decrypt pane ------------------------------------------------------
     def _dec_pane(self):
         sec = gpg_sec_keys()
         return Horizontal(
@@ -411,8 +308,8 @@ class PGPsus(App):
                 Label("Key (auto-detect):"),
                 Select([("(auto)","")] + [(uid,fp) for uid,fp in sec], id="dec-key", allow_blank=False),
                 Label("Passphrase:"), Input(password=True, id="dec-pass"),
-                Button("🔓 Decrypt", id="btn-dec", variant="success"),
-                Button("🗑 Clear",   id="btn-dec-clr", variant="default"),
+                Button("Decrypt", id="btn-dec", variant="success"),
+                Button("Clear",   id="btn-dec-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -422,15 +319,15 @@ class PGPsus(App):
             ),
         )
 
-    # ── Batch Decrypt pane ────────────────────────────────────────────────────
+    # -- Batch Decrypt pane ----------------------------------------------------
     def _batch_pane(self):
         return Horizontal(
             Vertical(
                 Label("Passphrase (GPG):"), Input(password=True, id="batch-pass"),
                 Label("PQC key file (optional):"), Input(placeholder="/path/to/priv.key", id="batch-pqc-key"),
-                Label("Separator:"), Input(value="─"*20, id="batch-sep"),
-                Button("📦 Decrypt All", id="btn-batch", variant="success"),
-                Button("🗑 Clear",       id="btn-batch-clr", variant="default"),
+                Label("Separator:"), Input(value="-"*20, id="batch-sep"),
+                Button("Decrypt All", id="btn-batch", variant="success"),
+                Button("Clear",       id="btn-batch-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -440,7 +337,7 @@ class PGPsus(App):
             ),
         )
 
-    # ── Key Generation pane ───────────────────────────────────────────────────
+    # -- Key Generation pane ---------------------------------------------------
     def _keygen_pane(self):
         return Horizontal(
             Vertical(
@@ -449,12 +346,11 @@ class PGPsus(App):
                     ("Ed25519 (recommended)", "ed25519"),
                     ("RSA 4096",              "rsa4096"),
                     ("RSA 2048",              "rsa2048"),
-                    ("PQC Hybrid (X25519+ML-KEM-768)", "pqc"),
+                    ("PQC Encrypt Key (X25519+ML-KEM-768)", "pqc"),
                 ], id="kg-type", allow_blank=False, value="ed25519"),
                 Label("Real name:"),    Input(placeholder="Alice", id="kg-name"),
                 Label("Email:"),        Input(placeholder="alice@example.com", id="kg-email"),
                 Label("Passphrase:"),   Input(password=True, id="kg-pass"),
-                Label("Confirm pass:"), Input(password=True, id="kg-pass2"),
                 Label("Expires (GPG):"),
                 Select([
                     ("Never", "0"),
@@ -462,7 +358,7 @@ class PGPsus(App):
                     ("2 years","2y"),
                     ("6 months","6m"),
                 ], id="kg-expire", allow_blank=False, value="0"),
-                Button("🔑 Generate", id="btn-kg", variant="success"),
+                Button("Generate", id="btn-kg", variant="success"),
                 id="sidebar",
             ),
             Vertical(
@@ -472,7 +368,7 @@ class PGPsus(App):
             ),
         )
 
-    # ── PQC Hybrid pane ───────────────────────────────────────────────────────
+    # -- PQC Hybrid pane -------------------------------------------------------
     def _pqc_pane(self):
         return Horizontal(
             Vertical(
@@ -485,8 +381,8 @@ class PGPsus(App):
                 Label("Public key (encrypt):"),  TextArea("", id="pqc-pub-key"),
                 Label("Private key (decrypt):"), Input(placeholder="/path/or/paste below", id="pqc-priv-path"),
                 TextArea("", id="pqc-priv-key"),
-                Button("🛡 Run", id="btn-pqc", variant="success"),
-                Button("🗑 Clear", id="btn-pqc-clr", variant="default"),
+                Button("Run", id="btn-pqc", variant="success"),
+                Button("Clear", id="btn-pqc-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -496,7 +392,7 @@ class PGPsus(App):
             ),
         )
 
-    # ── Sign / Verify pane ────────────────────────────────────────────────────
+    # -- Sign / Verify pane ----------------------------------------------------
     def _sign_verify_pane(self):
         sec = gpg_sec_keys()
         return Horizontal(
@@ -510,8 +406,8 @@ class PGPsus(App):
                 Label("Key:"),
                 Select([("(auto)","")] + [(uid,fp) for uid,fp in sec], id="sv-key", allow_blank=False),
                 Label("Passphrase:"), Input(password=True, id="sv-pass"),
-                Button("✍️ Run",  id="btn-sv",     variant="success"),
-                Button("🗑 Clear", id="btn-sv-clr", variant="default"),
+                Button("Run",  id="btn-sv",     variant="success"),
+                Button("Clear", id="btn-sv-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -521,7 +417,44 @@ class PGPsus(App):
             ),
         )
 
-    # ── File encrypt/decrypt pane ─────────────────────────────────────────────
+    # -- File encrypt/decrypt pane ---------------------------------------------
+    def _pqcsign_pane(self):
+        sec = gpg_sec_keys()
+        return Horizontal(
+            Vertical(
+                Label("Mode:"),
+                Select([
+                    ("ML-DSA-65 Keygen",       "mldsa-gen"),
+                    ("ML-DSA-65 Sign",          "mldsa-sign"),
+                    ("ML-DSA-65 Verify",        "mldsa-verify"),
+                    ("Hybrid Sign (PGP + ML-DSA-65)",   "hybrid-sign"),
+                    ("Hybrid Verify",           "hybrid-verify"),
+                ], id="pqs-mode", allow_blank=False, value="mldsa-gen"),
+                Label("PGP key (hybrid sign):"),
+                Select(
+                    [("(auto)", "")] + [(uid, fp) for uid, fp in sec],
+                    id="pqs-pgp-key", allow_blank=False,
+                ),
+                Label("PGP passphrase:"),
+                Input(password=True, id="pqs-pgp-pass"),
+                Label("ML-DSA-65 private key:"),
+                TextArea("", id="pqs-priv-key"),
+                Label("ML-DSA-65 public key (verify):"),
+                TextArea("", id="pqs-pub-key"),
+                Button("Run",   id="btn-pqs",     variant="success"),
+                Button("Clear", id="btn-pqs-clr", variant="default"),
+                id="sidebar",
+            ),
+            Vertical(
+                Label("Input / message:", classes="section-label"),
+                TextArea("", id="pqs-in"),
+                Label("Output:", classes="section-label"),
+                TextArea("", id="pqs-out", classes="output-area", read_only=True),
+                id="main-area",
+            ),
+        )
+
+    # -- File encrypt/decrypt pane ---------------------------------------------
     def _file_pane(self):
         pub = gpg_pub_keys()
         pub_opts = [(uid, fp) for uid, fp in pub] if pub else [("(no keys)", "")]
@@ -543,7 +476,7 @@ class PGPsus(App):
                 Label("Passphrase:"), Input(password=True, id="file-pass"),
                 Label("PQC key file:"),
                 Input(placeholder="/path/to/priv.key or pub.key", id="file-pqc-key"),
-                Button("📁 Run", id="btn-file", variant="success"),
+                Button("Run", id="btn-file", variant="success"),
                 id="sidebar",
             ),
             Vertical(
@@ -553,7 +486,7 @@ class PGPsus(App):
             ),
         )
 
-    # ── Symmetric encryption pane ─────────────────────────────────────────────
+    # -- Symmetric encryption pane ---------------------------------------------
     def _sym_pane(self):
         return Horizontal(
             Vertical(
@@ -570,8 +503,8 @@ class PGPsus(App):
                     ("Camellia-256",      "CAMELLIA256"),
                     ("Twofish",           "TWOFISH"),
                 ], id="sym-cipher", allow_blank=False, value="AES256"),
-                Button("🔐 Run",   id="btn-sym",     variant="success"),
-                Button("🗑 Clear", id="btn-sym-clr", variant="default"),
+                Button("Run",   id="btn-sym",     variant="success"),
+                Button("Clear", id="btn-sym-clr", variant="default"),
                 id="sidebar",
             ),
             Vertical(
@@ -581,54 +514,44 @@ class PGPsus(App):
             ),
         )
 
-    # ── Keys pane ─────────────────────────────────────────────────────────────
+    # -- Keys pane -------------------------------------------------------------
     def _keys_pane(self):
         return VerticalScroll(
-            # Live key search
-            Label("Filter keyring:", classes="section-label"),
-            Input(placeholder="name, email or fingerprint…", id="keys-filter"),
             TextArea(self._keys_text(), id="keys-text", read_only=True),
-            Button("🔄 Refresh", id="btn-keys-refresh", variant="default"),
+            Button("Refresh", id="btn-keys-refresh", variant="default"),
             # Keyserver lookup
             Label("Keyserver lookup:", classes="section-label"),
             Input(placeholder="email or fingerprint", id="ks-query"),
-            Button("🔍 Search",        id="btn-ks-search", variant="default"),
-            Button("📥 Fetch & Import", id="btn-ks-fetch",  variant="success"),
+            Button("Search",        id="btn-ks-search", variant="default"),
+            Button("Fetch & Import", id="btn-ks-fetch",  variant="success"),
             TextArea("", id="ks-out", read_only=True),
             # Import
             Label("Import key (paste block):", classes="section-label"),
             TextArea("", id="keys-import-text"),
-            Button("📥 Import", id="btn-keys-import", variant="success"),
+            Button("Import", id="btn-keys-import", variant="success"),
             # Export
             Label("Export key:", classes="section-label"),
             Input(placeholder="fingerprint or email", id="keys-export-id"),
-            Button("📤 Export Public", id="btn-keys-export-pub", variant="default"),
-            Button("📤 Export Secret", id="btn-keys-export-sec", variant="warning"),
+            Button("Export Public", id="btn-keys-export-pub", variant="default"),
+            Button("Export Secret", id="btn-keys-export-sec", variant="warning"),
             TextArea("", id="keys-export-out", read_only=True),
         )
 
-    def _keys_text(self, query: str = "") -> str:
+    def _keys_text(self):
         pub = gpg_pub_keys()
         sec = gpg_sec_keys()
-        q = query.lower().strip()
-        def matches(uid, fp):
-            return not q or q in uid.lower() or q in fp.lower()
         lines = ["GPG PUBLIC KEYS", "="*50]
-        matched = [(uid, fp) for uid, fp in pub if matches(uid, fp)]
-        for uid, fp in matched:
+        for uid, fp in pub:
             lines += [f"  {uid}", f"  {fp}", ""]
-        if not matched:
-            lines += [f"  (no public keys match '{q}')" if q else "  (none)", ""]
         lines += ["", "GPG SECRET KEYS", "="*50]
-        matched_sec = [(uid, fp) for uid, fp in sec if matches(uid, fp)]
-        for uid, fp in matched_sec:
+        for uid, fp in sec:
             lines += [f"  {uid}", f"  {fp}", ""]
-        if not matched_sec:
-            lines += [f"  (no secret keys match '{q}')" if q else "  (none)", ""]
+        if not pub and not sec:
+            lines += ["  (no keys found  import with: gpg --import keyfile.gpg)", ""]
         lines += [f"\nGPG home: {GPG_HOME}"]
         return "\n".join(lines)
 
-    # ── Merged pane: Encrypt (PGP + PQC) ─────────────────────────────────────
+    # -- Merged pane: Encrypt (PGP + PQC) -------------------------------------
     def _enc_merged_pane(self):
         pub = gpg_pub_keys()
         sec = gpg_sec_keys()
@@ -636,21 +559,20 @@ class PGPsus(App):
         return Vertical(
             Horizontal(
                 Label("Mode:"),
-                Select([("PGP Encrypt", "pgp"), ("PQC Hybrid", "pqc")],
+                Select([("PGP Encrypt", "pgp"), ("PQC Encrypt (X25519+ML-KEM-768)", "pqc")],
                        id="enc-mode", allow_blank=False, value="pgp"),
                 classes="mode-bar",
             ),
             Horizontal(
                 Vertical(
                     Label("Recipients (multi-select):"),
-                    Input(placeholder="filter recipients…", id="enc-recipient-filter"),
                     SelectionList(*pub_opts, id="enc-recipient"),
                     Label("Sign with (optional):"),
                     Select([("(none)", "")] + [(uid, fp) for uid, fp in sec],
                            id="enc-signer", allow_blank=False),
                     Label("Passphrase (signing):"), Input(password=True, id="enc-pass"),
-                    Button("🔒 Encrypt", id="btn-enc",     variant="success"),
-                    Button("🗑 Clear",   id="btn-enc-clr", variant="default"),
+                    Button("Encrypt", id="btn-enc",     variant="success"),
+                    Button("Clear",   id="btn-enc-clr", variant="default"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -673,8 +595,8 @@ class PGPsus(App):
                     Label("Private key (decrypt):"),
                     Input(placeholder="/path/or/paste below", id="pqc-priv-path"),
                     TextArea("", id="pqc-priv-key"),
-                    Button("🛡 Run",   id="btn-pqc",     variant="success"),
-                    Button("🗑 Clear", id="btn-pqc-clr", variant="default"),
+                    Button("Run",   id="btn-pqc",     variant="success"),
+                    Button("Clear", id="btn-pqc-clr", variant="default"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -693,7 +615,7 @@ class PGPsus(App):
         self.query_one("#enc-section-pgp").display = (event.value == "pgp")
         self.query_one("#enc-section-pqc").display = (event.value == "pqc")
 
-    # ── Merged pane: Decrypt (PGP + Batch + Symmetric) ───────────────────────
+    # -- Merged pane: Decrypt (PGP + Batch + Symmetric) -----------------------
     def _dec_merged_pane(self):
         sec = gpg_sec_keys()
         return Vertical(
@@ -712,8 +634,8 @@ class PGPsus(App):
                     Select([("(auto)", "")] + [(uid, fp) for uid, fp in sec],
                            id="dec-key", allow_blank=False),
                     Label("Passphrase:"), Input(password=True, id="dec-pass"),
-                    Button("🔓 Decrypt", id="btn-dec",     variant="success"),
-                    Button("🗑 Clear",   id="btn-dec-clr", variant="default"),
+                    Button("Decrypt", id="btn-dec",     variant="success"),
+                    Button("Clear",   id="btn-dec-clr", variant="default"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -730,9 +652,9 @@ class PGPsus(App):
                     Label("Passphrase (GPG):"), Input(password=True, id="batch-pass"),
                     Label("PQC key file (optional):"),
                     Input(placeholder="/path/to/priv.key", id="batch-pqc-key"),
-                    Label("Separator:"), Input(value="─"*20, id="batch-sep"),
-                    Button("📦 Decrypt All", id="btn-batch",     variant="success"),
-                    Button("🗑 Clear",       id="btn-batch-clr", variant="default"),
+                    Label("Separator:"), Input(value="-"*20, id="batch-sep"),
+                    Button("Decrypt All", id="btn-batch",     variant="success"),
+                    Button("Clear",       id="btn-batch-clr", variant="default"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -759,8 +681,8 @@ class PGPsus(App):
                         ("Camellia-256",      "CAMELLIA256"),
                         ("Twofish",           "TWOFISH"),
                     ], id="sym-cipher", allow_blank=False, value="AES256"),
-                    Button("🔐 Run",   id="btn-sym",     variant="success"),
-                    Button("🗑 Clear", id="btn-sym-clr", variant="default"),
+                    Button("Run",   id="btn-sym",     variant="success"),
+                    Button("Clear", id="btn-sym-clr", variant="default"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -780,7 +702,7 @@ class PGPsus(App):
         self.query_one("#dec-section-batch").display = (event.value == "batch")
         self.query_one("#dec-section-sym").display   = (event.value == "sym")
 
-    # ── Merged pane: Keys (Key List + Generate) ───────────────────────────────
+    # -- Merged pane: Keys (Key List + Generate) -------------------------------
     def _keys_merged_pane(self):
         return Vertical(
             Horizontal(
@@ -791,19 +713,19 @@ class PGPsus(App):
             ),
             VerticalScroll(
                 TextArea(self._keys_text(), id="keys-text", read_only=True),
-                Button("🔄 Refresh", id="btn-keys-refresh", variant="default"),
+                Button("Refresh", id="btn-keys-refresh", variant="default"),
                 Label("Keyserver lookup:", classes="section-label"),
                 Input(placeholder="email or fingerprint", id="ks-query"),
-                Button("🔍 Search",         id="btn-ks-search", variant="default"),
-                Button("📥 Fetch & Import", id="btn-ks-fetch",  variant="success"),
+                Button("Search",         id="btn-ks-search", variant="default"),
+                Button("Fetch & Import", id="btn-ks-fetch",  variant="success"),
                 TextArea("", id="ks-out", read_only=True),
                 Label("Import key (paste block):", classes="section-label"),
                 TextArea("", id="keys-import-text"),
-                Button("📥 Import", id="btn-keys-import", variant="success"),
+                Button("Import", id="btn-keys-import", variant="success"),
                 Label("Export key:", classes="section-label"),
                 Input(placeholder="fingerprint or email", id="keys-export-id"),
-                Button("📤 Export Public", id="btn-keys-export-pub", variant="default"),
-                Button("📤 Export Secret", id="btn-keys-export-sec", variant="warning"),
+                Button("Export Public", id="btn-keys-export-pub", variant="default"),
+                Button("Export Secret", id="btn-keys-export-sec", variant="warning"),
                 TextArea("", id="keys-export-out", read_only=True),
                 id="keys-section-list", classes="tab-section",
             ),
@@ -814,7 +736,8 @@ class PGPsus(App):
                         ("Ed25519 (recommended)",          "ed25519"),
                         ("RSA 4096",                       "rsa4096"),
                         ("RSA 2048",                       "rsa2048"),
-                        ("PQC Hybrid (X25519+ML-KEM-768)", "pqc"),
+                        ("PQC Encrypt Key (X25519+ML-KEM-768)", "pqc"),
+                        ("PGP + ML-DSA-65 (hybrid signing)", "pgp-mldsa"),
                     ], id="kg-type", allow_blank=False, value="ed25519"),
                     Label("Real name:"),    Input(placeholder="Alice", id="kg-name"),
                     Label("Email:"),        Input(placeholder="alice@example.com", id="kg-email"),
@@ -827,7 +750,7 @@ class PGPsus(App):
                         ("2 years",  "2y"),
                         ("6 months", "6m"),
                     ], id="kg-expire", allow_blank=False, value="0"),
-                    Button("🔑 Generate", id="btn-kg", variant="success"),
+                    Button("Generate", id="btn-kg", variant="success"),
                     id="sidebar",
                 ),
                 Vertical(
@@ -845,7 +768,7 @@ class PGPsus(App):
         self.query_one("#keys-section-list").display = (event.value == "list")
         self.query_one("#keys-section-gen").display  = (event.value == "gen")
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # -- Helpers ---------------------------------------------------------------
     def set_status(self, msg: str, ok: bool = True):
         bar = self.query_one("#status-bar", Label)
         bar.update(msg)
@@ -889,7 +812,7 @@ class PGPsus(App):
 
         self.set_status("Keys refreshed.")
 
-    # ── Button handlers ───────────────────────────────────────────────────────
+    # -- Button handlers -------------------------------------------------------
     @on(Button.Pressed, "#btn-enc")
     def do_encrypt(self):
         pt   = self.query_one("#enc-in",        TextArea).text.strip()
@@ -903,7 +826,7 @@ class PGPsus(App):
         r = gpg.encrypt(pt, **kw)
         if r.ok:
             self.query_one("#enc-out", TextArea).load_text(str(r))
-            self.set_status(f"Encrypted OK — {r.status}")
+            self.set_status(f"Encrypted OK: {r.status}")
         else:
             self.query_one("#enc-out", TextArea).load_text(f"ERROR:\n{r.stderr}")
             self.set_status(f"Encrypt failed: {r.status}", ok=False)
@@ -916,7 +839,7 @@ class PGPsus(App):
         r = gpg.decrypt(ct, passphrase=pp or None, always_trust=True)
         if r.ok:
             self.query_one("#dec-out", TextArea).load_text(str(r))
-            self.set_status(f"Decrypted OK — signed by: {r.username or 'unsigned'}")
+            self.set_status(f"Decrypted OK, signed by: {r.username or 'unsigned'}")
         else:
             self.query_one("#dec-out", TextArea).load_text(f"ERROR:\n{r.stderr}")
             self.set_status(f"Decrypt failed: {r.status}", ok=False)
@@ -948,20 +871,20 @@ class PGPsus(App):
             r = gpg.decrypt(block, passphrase=pp or None, always_trust=True)
             if r.ok:
                 ok_count += 1
-                results.append(f"[GPG {i}/{len(pgp_blocks)}] ✓ {r.username or 'unsigned'}\n{str(r)}")
+                results.append(f"[GPG {i}/{len(pgp_blocks)}]  {r.username or 'unsigned'}\n{str(r)}")
             else:
-                results.append(f"[GPG {i}/{len(pgp_blocks)}] ✗ {r.status}\n{r.stderr.strip()}")
+                results.append(f"[GPG {i}/{len(pgp_blocks)}]  {r.status}\n{r.stderr.strip()}")
 
         for i, block in enumerate(hyb_blocks, 1):
             if not pqc_priv:
-                results.append(f"[PQC {i}/{len(hyb_blocks)}] ✗ No PQC private key provided")
+                results.append(f"[PQC {i}/{len(hyb_blocks)}]  No PQC private key provided")
                 continue
             try:
                 pt = hybrid_crypto.decrypt(block, pqc_priv)
                 ok_count += 1
-                results.append(f"[PQC {i}/{len(hyb_blocks)}] ✓\n{pt}")
+                results.append(f"[PQC {i}/{len(hyb_blocks)}] \n{pt}")
             except Exception as e:
-                results.append(f"[PQC {i}/{len(hyb_blocks)}] ✗ {e}")
+                results.append(f"[PQC {i}/{len(hyb_blocks)}]  {e}")
 
         self.query_one("#batch-out", TextArea).load_text(f"\n{sep}\n".join(results))
         self.set_status(f"Batch: {ok_count}/{total} decrypted OK")
@@ -982,6 +905,45 @@ class PGPsus(App):
 
         out = self.query_one("#kg-out", TextArea)
 
+        if ktype == "pgp-mldsa":
+            if not name or not email:
+                return self.set_status("Name and email required.", ok=False)
+            if pp != pp2:
+                return self.set_status("Passphrases don't match.", ok=False)
+            try:
+                inp_kw = dict(
+                    key_type="EDDSA", name_real=name, name_email=email,
+                    expire_date=expire, passphrase=pp or None,
+                )
+                inp = gpg.gen_key_input(**inp_kw)
+                self.set_status("Generating GPG component...")
+                key = gpg.gen_key(inp)
+                if not key.fingerprint:
+                    out.load_text(f"GPG key generation failed.\n{key.stderr}")
+                    return self.set_status("GPG key generation failed.", ok=False)
+                pgp_pub = gpg.export_keys(key.fingerprint, armor=True)
+                mldsa_pub, mldsa_priv = pqsign_crypto.generate_keypair()
+                result = (
+                    f"PGP + ML-DSA-65 Hybrid Signing Key Bundle\n"
+                    f"Identity: {name} <{email}>\n"
+                    f"{'='*50}\n\n"
+                    f"--- PGP COMPONENT (Ed25519) ---\n"
+                    f"Fingerprint: {key.fingerprint}\n\n"
+                    f"{pgp_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"--- ML-DSA-65 COMPONENT ---\n\n"
+                    f"{mldsa_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"ML-DSA-65 PRIVATE KEY (do not share):\n\n"
+                    f"{mldsa_priv}"
+                )
+                out.load_text(result)
+                self.set_status(f"Hybrid signing key bundle generated: {key.fingerprint[-16:]}")
+            except Exception as e:
+                out.load_text(f"ERROR: {e}")
+                self.set_status(f"Hybrid keygen failed: {e}", ok=False)
+            return
+
         if ktype == "pqc":
             try:
                 pub, priv = hybrid_crypto.generate_keypair()
@@ -993,7 +955,7 @@ class PGPsus(App):
                     f"{'='*50}\n\n"
                     f"{pub_arm}\n\n"
                     f"{'='*50}\n"
-                    f"PRIVATE KEY — KEEP SECRET:\n\n"
+                    f"PRIVATE KEY (do not share):\n\n"
                     f"{priv_arm}"
                 )
                 out.load_text(result)
@@ -1014,7 +976,7 @@ class PGPsus(App):
             inp_kw["key_length"] = int(key_len)
 
         inp = gpg.gen_key_input(**inp_kw)
-        self.set_status("Generating key… (may take a moment)")
+        self.set_status("Generating key (may take a moment)")
         key = gpg.gen_key(inp)
         if key.fingerprint:
             out.load_text(
@@ -1024,7 +986,7 @@ class PGPsus(App):
                 f"Fingerprint: {key.fingerprint}\n"
                 f"Expires:     {expire if expire != '0' else 'never'}\n\n"
                 f"Export public key:\n  gpg --armor --export {key.fingerprint}\n\n"
-                f"Export private key (KEEP SECRET):\n  gpg --armor --export-secret-keys {key.fingerprint}"
+                f"Export private key:\n  gpg --armor --export-secret-keys {key.fingerprint}"
             )
             self.set_status(f"Key generated: {key.fingerprint[-16:]}")
         else:
@@ -1043,7 +1005,7 @@ class PGPsus(App):
                 out.load_text(
                     f"X25519 + ML-KEM-768 Hybrid Keypair\n{'='*50}\n\n"
                     f"{hybrid_crypto.armor_public_key(pub)}\n\n"
-                    f"{'='*50}\nPRIVATE KEY — KEEP SECRET:\n\n"
+                    f"{'='*50}\nPRIVATE KEY (do not share):\n\n"
                     f"{hybrid_crypto.armor_private_key(priv)}"
                 )
                 self.set_status("PQC keypair generated.")
@@ -1103,7 +1065,7 @@ class PGPsus(App):
             signed = str(result)
             if signed:
                 out.load_text(signed)
-                self.set_status(f"Signed OK — {result.status}")
+                self.set_status(f"Signed OK: {result.status}")
             else:
                 out.load_text(f"Signing failed.\nStatus: {result.status}\nStderr: {result.stderr}")
                 self.set_status(f"Sign failed: {result.status}", ok=False)
@@ -1114,11 +1076,11 @@ class PGPsus(App):
                 import datetime
                 ts = ""
                 try:
-                    ts = datetime.datetime.fromtimestamp(float(result.timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+                    ts = datetime.datetime.utcfromtimestamp(float(result.timestamp)).strftime("%Y-%m-%d %H:%M:%S UTC")
                 except Exception:
                     ts = str(result.timestamp)
                 out.load_text(
-                    f"✓ VALID signature\n"
+                    f"VALID signature\n"
                     f"User:      {result.username}\n"
                     f"Key ID:    {result.key_id}\n"
                     f"Timestamp: {ts}\n"
@@ -1127,11 +1089,126 @@ class PGPsus(App):
                 self.set_status("Signature valid.")
             else:
                 out.load_text(
-                    f"✗ INVALID / unverified\n"
+                    f"INVALID / unverified\n"
                     f"Status: {result.status}\n"
                     f"Key ID: {result.key_id or '(unknown)'}"
                 )
                 self.set_status("Signature invalid or not found.", ok=False)
+
+    @on(Button.Pressed, "#btn-pqs-clr")
+    def pqs_clear(self):
+        for wid in ("#pqs-in", "#pqs-out", "#pqs-priv-key", "#pqs-pub-key"):
+            self.query_one(wid, TextArea).load_text("")
+        self.set_status("Cleared.")
+
+    @on(Button.Pressed, "#btn-pqs")
+    def do_pqcsign(self):
+        mode     = self.query_one("#pqs-mode",     Select).value
+        msg      = self.query_one("#pqs-in",       TextArea).text.strip()
+        priv_txt = self.query_one("#pqs-priv-key", TextArea).text.strip()
+        pub_txt  = self.query_one("#pqs-pub-key",  TextArea).text.strip()
+        pgp_fp   = self.query_one("#pqs-pgp-key",  Select).value
+        pgp_pp   = self.query_one("#pqs-pgp-pass", Input).value
+        out      = self.query_one("#pqs-out",      TextArea)
+
+        if mode == "mldsa-gen":
+            try:
+                pub, priv = pqsign_crypto.generate_keypair()
+                info = pqsign_crypto.KEY_INFO
+                out.load_text(
+                    f"Algorithm : {info['algorithm']}\n"
+                    f"Standard  : {info['standard']}\n"
+                    f"Pub size  : {info['pub_bytes']} bytes\n"
+                    f"Priv size : {info['priv_bytes']} bytes\n"
+                    f"Sig size  : {info['sig_bytes']} bytes\n\n"
+                    f"{pub}\n\n"
+                    f"--- PRIVATE KEY (do not share) ---\n\n"
+                    f"{priv}"
+                )
+                self.set_status("ML-DSA-65 keypair generated.")
+            except Exception as e:
+                self.set_status(f"Keygen error: {e}", ok=False)
+
+        elif mode == "mldsa-sign":
+            if not priv_txt:
+                return self.set_status("Paste ML-DSA-65 private key.", ok=False)
+            if not msg:
+                return self.set_status("No message to sign.", ok=False)
+            try:
+                sig = pqsign_crypto.sign_message(priv_txt, msg)
+                out.load_text(sig)
+                self.set_status("Signed.")
+            except Exception as e:
+                self.set_status(f"Sign error: {e}", ok=False)
+
+        elif mode == "mldsa-verify":
+            if not pub_txt:
+                return self.set_status("Paste ML-DSA-65 public key.", ok=False)
+            sig_txt = msg  # input field holds the armored signature
+            if not sig_txt:
+                return self.set_status("Paste signature in Input field.", ok=False)
+            # expect "message\n---\nsignature" or just signature if msg known
+            # convention: input = original message; pub-key field = pub; priv-key field = sig
+            sig_field = self.query_one("#pqs-priv-key", TextArea).text.strip()
+            if not sig_field:
+                return self.set_status("Paste signature in private key field.", ok=False)
+            try:
+                pqsign_crypto.verify_message(pub_txt, msg, sig_field)
+                out.load_text("Signature valid.\nAlgorithm: ML-DSA-65 (NIST FIPS 204)")
+                self.set_status("Signature valid.")
+            except Exception as e:
+                out.load_text(f"Invalid: {e}")
+                self.set_status(f"Signature invalid: {e}", ok=False)
+
+        elif mode == "hybrid-sign":
+            if not priv_txt:
+                return self.set_status("Paste ML-DSA-65 private key.", ok=False)
+            if not msg:
+                return self.set_status("No message to sign.", ok=False)
+            try:
+                # PGP clearsign
+                kw = dict(clearsign=True, passphrase=pgp_pp or None)
+                if pgp_fp:
+                    kw["keyid"] = pgp_fp
+                pgp_result = gpg.sign(msg, **kw)
+                if not str(pgp_result):
+                    return self.set_status(
+                        f"PGP sign failed: {pgp_result.status}", ok=False
+                    )
+                # ML-DSA-65 signature
+                mldsa_sig = pqsign_crypto.sign_message(priv_txt, msg)
+                # Extract pub key from priv (re-derive via keygen not possible;
+                # user must supply pub key separately -- use pub_txt if provided)
+                if not pub_txt:
+                    return self.set_status(
+                        "Paste ML-DSA-65 public key for hybrid bundle.", ok=False
+                    )
+                bundle = pqsign_crypto.make_hybrid_bundle(
+                    str(pgp_result), mldsa_sig, pub_txt, msg
+                )
+                out.load_text(bundle)
+                self.set_status("Hybrid signature bundle created.")
+            except Exception as e:
+                self.set_status(f"Hybrid sign error: {e}", ok=False)
+
+        elif mode == "hybrid-verify":
+            bundle = msg
+            if not bundle:
+                return self.set_status("Paste hybrid bundle in Input field.", ok=False)
+            try:
+                result = pqsign_crypto.verify_hybrid_bundle(bundle, gpg)
+                out.load_text(
+                    f"Both signatures valid.\n\n"
+                    f"PGP key ID : {result['pgp_info']['key_id']}\n"
+                    f"PGP user   : {result['pgp_info']['username']}\n"
+                    f"PGP status : {result['pgp_info']['status']}\n\n"
+                    f"ML-DSA-65  : {result['mldsa_info']['algorithm']}\n"
+                    f"Message    : {result['message']}"
+                )
+                self.set_status("Hybrid bundle verified.")
+            except Exception as e:
+                out.load_text(f"Verification failed: {e}")
+                self.set_status(f"Hybrid verify failed: {e}", ok=False)
 
     @on(Button.Pressed, "#btn-file")
     def do_file(self):
@@ -1156,10 +1233,10 @@ class PGPsus(App):
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
                 if r.returncode == 0:
-                    out.load_text(f"✓ Encrypted to: {dst}\n{r.stdout}")
-                    self.set_status(f"GPG file encrypted → {Path(dst).name}")
+                    out.load_text(f"Encrypted to: {dst}\n{r.stdout}")
+                    self.set_status(f"GPG file encrypted  {Path(dst).name}")
                 else:
-                    out.load_text(f"✗ GPG error:\n{r.stderr}")
+                    out.load_text(f"GPG error:\n{r.stderr}")
                     self.set_status("GPG encrypt failed.", ok=False)
             except Exception as e:
                 out.load_text(f"Error: {e}")
@@ -1179,10 +1256,10 @@ class PGPsus(App):
             try:
                 r = subprocess.run(cmd, input=pp, capture_output=True, text=True, timeout=30)
                 if r.returncode == 0:
-                    out.load_text(f"✓ Decrypted to: {dst}\n{r.stdout}")
-                    self.set_status(f"GPG file decrypted → {Path(dst).name}")
+                    out.load_text(f"Decrypted to: {dst}\n{r.stdout}")
+                    self.set_status(f"GPG file decrypted  {Path(dst).name}")
                 else:
-                    out.load_text(f"✗ GPG error:\n{r.stderr}")
+                    out.load_text(f"GPG error:\n{r.stderr}")
                     self.set_status("GPG decrypt failed.", ok=False)
             except Exception as e:
                 out.load_text(f"Error: {e}")
@@ -1200,8 +1277,8 @@ class PGPsus(App):
                 b64_data = base64.b64encode(data).decode("utf-8")
                 ct = hybrid_crypto.encrypt(b64_data, pub)
                 Path(dst).write_text(ct)
-                out.load_text(f"✓ PQC encrypted to: {dst}")
-                self.set_status(f"PQC file encrypted → {Path(dst).name}")
+                out.load_text(f"PQC encrypted to: {dst}")
+                self.set_status(f"PQC file encrypted  {Path(dst).name}")
             except Exception as e:
                 out.load_text(f"Error: {e}")
                 self.set_status(str(e), ok=False)
@@ -1222,8 +1299,8 @@ class PGPsus(App):
                 b64_data = hybrid_crypto.decrypt(armored, priv)
                 file_bytes = base64.b64decode(b64_data)
                 Path(dst).write_bytes(file_bytes)
-                out.load_text(f"✓ PQC decrypted to: {dst}")
-                self.set_status(f"PQC file decrypted → {Path(dst).name}")
+                out.load_text(f"PQC decrypted to: {dst}")
+                self.set_status(f"PQC file decrypted  {Path(dst).name}")
             except Exception as e:
                 out.load_text(f"Error: {e}")
                 self.set_status(str(e), ok=False)
@@ -1299,7 +1376,7 @@ class PGPsus(App):
             if r.returncode == 0:
                 self._refresh_all_key_selects()
             else:
-                self.set_status("Fetch failed — see output.", ok=False)
+                self.set_status("Fetch failed  see output.", ok=False)
         except Exception as e:
             self.query_one("#ks-out", TextArea).load_text(f"Error: {e}")
             self.set_status(str(e), ok=False)
@@ -1341,7 +1418,7 @@ class PGPsus(App):
         armor = gpg.export_keys(fpr, secret=True, armor=True)
         if armor:
             self.query_one("#keys-export-out", TextArea).load_text(armor)
-            self.set_status(f"Exported SECRET key: {fpr} — handle with care!")
+            self.set_status(f"Exported SECRET key: {fpr}  handle with care!")
         else:
             self.set_status(f"No secret key found for: {fpr}", ok=False)
 
@@ -1384,31 +1461,6 @@ class PGPsus(App):
     @on(Button.Pressed, "#btn-keys-refresh")
     def keys_refresh(self):
         self._refresh_all_key_selects()
-
-    @on(Input.Changed, "#keys-filter")
-    def keys_filter_changed(self, event: Input.Changed) -> None:
-        """Live-filter the keyring display as the user types."""
-        for ta in self.query("#keys-text"):
-            ta.load_text(self._keys_text(event.value))
-
-    def _filter_selection_list(self, list_id: str, query: str) -> None:
-        """Rebuild a SelectionList to show only keys matching query."""
-        pub = gpg_pub_keys()
-        q = query.lower().strip()
-        filtered = [(uid, fp) for uid, fp in pub if not q or q in uid.lower() or q in fp.lower()]
-        try:
-            sl = self.query_one(f"#{list_id}", SelectionList)
-            sl.clear_options()
-            for uid, fp in filtered:
-                sl.add_option((uid, fp))
-            if not filtered:
-                sl.add_option((f"(no keys match '{q}')" if q else "(no keys)", ""))
-        except Exception:
-            pass
-
-    @on(Input.Changed, "#enc-recipient-filter")
-    def enc_recipient_filter(self, event: Input.Changed) -> None:
-        self._filter_selection_list("enc-recipient", event.value)
 
 
 if __name__ == "__main__":
