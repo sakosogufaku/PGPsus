@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""PGPsus v1.4 - PGP / PQC signing and encryption TUI."""
-VERSION = "1.4"
+"""PGPsus v1.5 - PGP / PQC signing and encryption TUI."""
+VERSION = "1.5"
 
 import gnupg, os, re, base64, json, subprocess, shutil
 import time as _time
@@ -125,6 +125,10 @@ Screen { background: $background; color: $foreground; }
 #theme-bar.light {
     background: #e8e8e0;
     border-bottom: solid #cccccc;
+}
+#theme-bar.heavenly {
+    background: #ddf0fb;
+    border-bottom: solid #90c8e8;
 }
 #theme-bar Label { color: #888888; margin-right: 1; }
 #theme-bar.light Label { color: #555555; }
