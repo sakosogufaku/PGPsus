@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 captaincanary contributors
 """PGPsus v1.7 - PGP / PQC signing and encryption TUI."""
-VERSION = "1.7"
+VERSION = "1.8"
 
 import gnupg, os, re, base64, json, subprocess, shutil
 import time as _time
+import threading
+import datetime
+import urllib.request
+import socket, struct, hashlib, secrets
+from urllib.parse import quote as url_quote
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes as _hashes
 os.environ["TZ"] = "UTC"
 _time.tzset()
 import pqsign_crypto
@@ -15,11 +24,24 @@ from textual.widgets import (
     TextArea, Select, SelectionList, Button, Label, Input, Static
 )
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.reactive import reactive
+from textual.reactive import reactive  # noqa: F401 – kept for subclass use
 from textual.events import Paste
 from textual import on
 
 import hybrid_crypto
+
+
+class SafeTextArea(TextArea):
+    """TextArea with paste debounce — prevents double-paste from both
+    bracketed-paste (on_paste) and TextArea's built-in Ctrl+V (action_paste)."""
+    def on_paste(self, event: Paste) -> None:
+        event.stop()
+        if self.app._paste_allowed():  # type: ignore[attr-defined]
+            self.insert(event.text)
+
+    def action_paste(self) -> None:
+        if self.app._paste_allowed():  # type: ignore[attr-defined]
+            super().action_paste()
 
 def _clipboard_paste() -> str:
     """Read clipboard text using whatever tool is available."""
@@ -62,11 +84,119 @@ PGP_BLOCK_RE = re.compile(
 HYB_BLOCK_RE = re.compile(
     r"-----BEGIN HYBRID MESSAGE-----.*?-----END HYBRID MESSAGE-----", re.DOTALL)
 
+# -- Deadman Storage utilities ------------------------------------------------
+_DM_ONION   = "kb6lxykxqasqm4j4vses5cdkbgi7hrmez4ttllvh6g4wec3ufpju7tid.onion"
+_DM_SALT    = b"deadman-v1"
+_BIP39_PATH = os.path.join(os.path.dirname(__file__),
+              "../opencanary-pkgs/passlib/_data/wordsets/bip39.txt")
+
+def _dm_words():
+    path = os.path.normpath(_BIP39_PATH)
+    with open(path) as f:
+        words = [w.strip() for w in f if w.strip()]
+    assert len(words) == 2048
+    return words
+
+def _dm_entropy_to_mnemonic(entropy: bytes) -> str:
+    words = _dm_words()
+    h = hashlib.sha256(entropy).digest()
+    ent_int = int.from_bytes(entropy, "big")
+    cs_int  = int.from_bytes(h, "big") >> 248
+    combined = (ent_int << 8) | cs_int
+    result = []
+    for _ in range(24):
+        result.append(words[combined & 0x7FF])
+        combined >>= 11
+    return " ".join(reversed(result))
+
+def _dm_mnemonic_to_entropy(mnemonic: str) -> bytes:
+    words = _dm_words()
+    wl = mnemonic.strip().split()
+    if len(wl) != 24:
+        raise ValueError(f"Expected 24 words, got {len(wl)}")
+    combined = 0
+    for w in wl:
+        combined = (combined << 11) | words.index(w)
+    cs = combined & 0xFF
+    entropy = (combined >> 8).to_bytes(32, "big")
+    expected = int.from_bytes(hashlib.sha256(entropy).digest(), "big") >> 248
+    if cs != expected:
+        raise ValueError("BIP39 checksum mismatch — invalid mnemonic")
+    return entropy
+
+def _dm_hkdf(ikm: bytes, info: bytes) -> bytes:
+    return HKDF(algorithm=_hashes.SHA256(), length=32,
+                salt=_DM_SALT, info=info).derive(ikm)
+
+def _dm_derive(mnemonic: str) -> dict:
+    e          = _dm_mnemonic_to_entropy(mnemonic)
+    vault_id   = _dm_hkdf(e, b"vault-id")
+    switch_key = _dm_hkdf(e, b"switch")
+    switch_ver = _dm_hkdf(switch_key, b"switch-verifier")
+    return {"vault_id": vault_id.hex(), "switch_verifier": switch_ver.hex()}
+
+def _dm_socks5(host: str, port: int = 80, proxy: str = "127.0.0.1:9050"):
+    ph, pp = proxy.split(":")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(30)
+    s.connect((ph, int(pp)))
+    s.sendall(b"\x05\x01\x00")
+    if s.recv(2) != b"\x05\x00":
+        raise ConnectionError("SOCKS5 auth failed")
+    addr = host.encode()
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(addr)]) + addr + struct.pack(">H", port))
+    r = s.recv(10)
+    if r[1] != 0:
+        raise ConnectionError(f"SOCKS5 connect failed: {r[1]}")
+    return s
+
+def _dm_http_post(path: str, body: dict, gateway: str, proxy: str) -> dict:
+    host = gateway.replace("http://", "").rstrip("/")
+    data = json.dumps(body).encode()
+    req  = (f"POST {path} HTTP/1.0\r\nHost: {host}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n"
+            ).encode() + data
+    sock = _dm_socks5(host, 80, proxy)
+    sock.sendall(req)
+    resp = b""
+    while True:
+        d = sock.recv(4096)
+        if not d:
+            break
+        resp += d
+    sock.close()
+    _, _, body_raw = resp.decode().partition("\r\n\r\n")
+    return json.loads(body_raw)
+
 def gpg_pub_keys():
     return [(k["uids"][0] if k["uids"] else k["keyid"], k["fingerprint"]) for k in gpg.list_keys()]
 
 def gpg_sec_keys():
     return [(k["uids"][0] if k["uids"] else k["keyid"], k["fingerprint"]) for k in gpg.list_keys(True)]
+
+def xmr_latest_block() -> str:
+    """Fetch latest Monero block height, hash, and timestamp via public node JSON-RPC."""
+    try:
+        payload = json.dumps({
+            "jsonrpc": "2.0", "id": "0", "method": "get_last_block_header"
+        }).encode()
+        req = urllib.request.Request(
+            "https://node.sethforprivacy.com/json_rpc",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+        hdr = data["result"]["block_header"]
+        ts_utc = datetime.datetime.utcfromtimestamp(hdr["timestamp"]).strftime("%Y-%m-%d %H:%M:%S UTC")
+        return (
+            f"Latest XMR block: #{hdr['height']}\n"
+            f"Hash: {hdr['hash']}\n"
+            f"Timestamp: {ts_utc}\n"
+            f"Source: node.sethforprivacy.com"
+        )
+    except Exception as e:
+        return f"XMR fetch failed: {e}"
 
 # -- Themes --------------------------------------------------------------------
 THEMES = {
@@ -186,25 +316,47 @@ TextArea {
 }
 .status-ok  { color: $success; }
 .status-err { color: $error;   }
-.merged-pane { height: 1fr; }
-.mode-bar { height: 3; padding: 0 1; align: left middle; }
-.tab-section { height: 1fr; }
+/* Lock layout so Tabs bar never scrolls off-screen */
+TabbedContent            { height: 1fr; overflow: hidden hidden; }
+TabbedContent ContentSwitcher { height: 1fr; overflow: hidden hidden; }
+TabPane                  { height: 1fr; overflow: hidden hidden; }
+.merged-pane             { height: 1fr; overflow: hidden hidden; }
+/* Sidebar and main area scroll independently */
+#sidebar   { overflow-y: auto; }
+#main-area { overflow-y: auto; }
+.tab-section { height: auto; }
 .tab-section.hidden { display: none; }
+.hidden { display: none; }
+/* Keys tab: fixed initial heights so Alt+Up/Down has a concrete starting point */
+#keys-text        { height: 12; }
+#ks-out           { height: 8;  }
+#keys-import-text { height: 8;  }
+#keys-import-out  { height: 4;  }
+#keys-export-out  { height: 10; }
+#batch-pqc-keys   { height: 4;  }
+/* Compact paired action buttons (Encrypt/Clear, Run/Clear, etc.) */
+.btn-row { height: 3; margin-bottom: 1; }
+.btn-row Button { width: 1fr; margin-bottom: 0; }
 """
 
 class PGPsus(App):
     CSS = CSS
     TITLE = "PGPsus"
     BINDINGS = [
-        ("ctrl+q", "quit",            "Quit"),
-        ("ctrl+e", "tab('tab-enc')",  "Encrypt"),
-        ("ctrl+d", "tab('tab-dec')",  "Decrypt"),
-        ("ctrl+s", "tab('tab-sign')", "Sign"),
-        ("ctrl+q", "tab('tab-pqcsign')", "PQC Sign"),
-        ("ctrl+k", "tab('tab-keys')", "Keys"),
-        ("ctrl+f", "tab('tab-file')", "File"),
-        ("ctrl+v", "paste",           "Paste"),
-        ("ctrl+y", "copy",            "Copy"),
+        ("ctrl+q",   "quit",              "Quit"),
+        ("ctrl+e",   "tab('tab-enc')",    "Encrypt"),
+        ("ctrl+d",   "tab('tab-dec')",    "Decrypt"),
+        ("ctrl+s",   "tab('tab-sign')",   "Sign"),
+        ("ctrl+p",   "tab('tab-pqcsign')","PQC Sign"),
+        ("ctrl+k",   "tab('tab-keys')",   "Keys"),
+        ("ctrl+f",   "tab('tab-file')",   "File"),
+        ("ctrl+m",   "tab('tab-deadman')", "Deadman"),
+        ("ctrl+v",   "paste",             "Paste"),
+        ("ctrl+y",   "copy",              "Copy"),
+        ("alt+up",    "resize_up",      "Taller"),
+        ("alt+down",  "resize_down",    "Shorter"),
+        ("alt+left",  "resize_left",    "Narrower"),
+        ("alt+right", "resize_right",   "Wider"),
     ]
 
     def _insert_text(self, text: str) -> None:
@@ -217,13 +369,27 @@ class PGPsus(App):
             w.value = w.value[:pos] + text + w.value[pos:]
             w.cursor_position = pos + len(text)
 
+    def _paste_allowed(self) -> bool:
+        """Return True if enough time has passed since last paste (1s debounce)."""
+        now = _time.monotonic()
+        if now - getattr(self, "_last_paste_time", 0) < 1.0:
+            self.notify("Paste ignored (too fast — wait 1s)", severity="warning")
+            return False
+        self._last_paste_time = now
+        return True
+
     def on_paste(self, event: Paste) -> None:
-        """Handle terminal bracketed paste (Ctrl+Shift+V in most terminals)."""
+        """Handle terminal bracketed paste — only for Input fields (SafeTextArea handles TextArea)."""
         event.stop()
-        self._insert_text(event.text)
+        if isinstance(self.focused, SafeTextArea):
+            return  # SafeTextArea.on_paste handles this with its own debounce
+        if self._paste_allowed():
+            self._insert_text(event.text)
 
     def action_paste(self) -> None:
         """Ctrl+V: read from system clipboard and insert into focused widget."""
+        if not self._paste_allowed():
+            return
         text = _clipboard_paste()
         if text:
             self._insert_text(text)
@@ -265,6 +431,7 @@ class PGPsus(App):
             with TabPane("PQC Sign",    id="tab-pqcsign"): yield self._pqcsign_pane()
             with TabPane("Keys",        id="tab-keys"):    yield self._keys_merged_pane()
             with TabPane("File",        id="tab-file"): yield self._file_pane()
+            with TabPane("Deadman",     id="tab-deadman"): yield self._deadman_pane()
         yield Label("Ready", id="status-bar")
         yield Footer()
 
@@ -277,7 +444,6 @@ class PGPsus(App):
         self._update_utc_clock()
 
     def _update_utc_clock(self):
-        import datetime
         now = datetime.datetime.utcnow()
         self.query_one("#utc-clock", Label).update(now.strftime("%Y-%m-%d %H:%M:%S UTC"))
 
@@ -323,121 +489,6 @@ class PGPsus(App):
     @on(Button.Pressed, "#theme-btn-infernal")
     def theme_infernal(self): self._switch_theme("infernal")
 
-    # -- PGP Encrypt pane ------------------------------------------------------
-    def _enc_pane(self):
-        pub = gpg_pub_keys()
-        sec = gpg_sec_keys()
-        pub_opts = [(uid, fp) for uid, fp in pub] if pub else [("(no keys)", "")]
-        return Horizontal(
-            Vertical(
-                Label("Recipients (multi-select):"),
-                SelectionList(*pub_opts, id="enc-recipient"),
-                Label("Sign with (optional):"),
-                Select([("(none)","")] + [(uid,fp) for uid,fp in sec], id="enc-signer", allow_blank=False),
-                Label("Passphrase (signing):"), Input(password=True, id="enc-pass"),
-                Button("Encrypt", id="btn-enc", variant="success"),
-                Button("Clear",   id="btn-enc-clr", variant="default"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Plaintext:", classes="section-label"), TextArea("", id="enc-in"),
-                Label("Ciphertext:", classes="section-label"), TextArea("", id="enc-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
-    # -- PGP Decrypt pane ------------------------------------------------------
-    def _dec_pane(self):
-        sec = gpg_sec_keys()
-        return Horizontal(
-            Vertical(
-                Label("Key (auto-detect):"),
-                Select([("(auto)","")] + [(uid,fp) for uid,fp in sec], id="dec-key", allow_blank=False),
-                Label("Passphrase:"), Input(password=True, id="dec-pass"),
-                Button("Decrypt", id="btn-dec", variant="success"),
-                Button("Clear",   id="btn-dec-clr", variant="default"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Ciphertext (paste):", classes="section-label"), TextArea("", id="dec-in"),
-                Label("Plaintext:", classes="section-label"), TextArea("", id="dec-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
-    # -- Batch Decrypt pane ----------------------------------------------------
-    def _batch_pane(self):
-        return Horizontal(
-            Vertical(
-                Label("Passphrase (GPG):"), Input(password=True, id="batch-pass"),
-                Label("PQC key file (optional):"), Input(placeholder="/path/to/priv.key", id="batch-pqc-key"),
-                Label("Separator:"), Input(value="-"*20, id="batch-sep"),
-                Button("Decrypt All", id="btn-batch", variant="success"),
-                Button("Clear",       id="btn-batch-clr", variant="default"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Paste PGP/PQC blocks here:", classes="section-label"), TextArea("", id="batch-in"),
-                Label("Results:", classes="section-label"), TextArea("", id="batch-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
-    # -- Key Generation pane ---------------------------------------------------
-    def _keygen_pane(self):
-        return Horizontal(
-            Vertical(
-                Label("Key type:"),
-                Select([
-                    ("Ed25519 (recommended)", "ed25519"),
-                    ("RSA 4096",              "rsa4096"),
-                    ("RSA 2048",              "rsa2048"),
-                    ("PQC Encrypt Key (X25519+ML-KEM-768)", "pqc"),
-                ], id="kg-type", allow_blank=False, value="ed25519"),
-                Label("Real name:"),    Input(placeholder="Alice", id="kg-name"),
-                Label("Email:"),        Input(placeholder="alice@example.com", id="kg-email"),
-                Label("Passphrase:"),   Input(password=True, id="kg-pass"),
-                Label("Expires (GPG):"),
-                Select([
-                    ("Never", "0"),
-                    ("1 year", "1y"),
-                    ("2 years","2y"),
-                    ("6 months","6m"),
-                ], id="kg-expire", allow_blank=False, value="0"),
-                Button("Generate", id="btn-kg", variant="success"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Output:", classes="section-label"),
-                TextArea("", id="kg-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
-    # -- PQC Hybrid pane -------------------------------------------------------
-    def _pqc_pane(self):
-        return Horizontal(
-            Vertical(
-                Label("Mode:"),
-                Select([
-                    ("Encrypt", "enc"),
-                    ("Decrypt", "dec"),
-                    ("Generate keypair", "gen"),
-                ], id="pqc-mode", allow_blank=False, value="enc"),
-                Label("Public key (encrypt):"),  TextArea("", id="pqc-pub-key"),
-                Label("Private key (decrypt):"), Input(placeholder="/path/or/paste below", id="pqc-priv-path"),
-                TextArea("", id="pqc-priv-key"),
-                Button("Run", id="btn-pqc", variant="success"),
-                Button("Clear", id="btn-pqc-clr", variant="default"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Input:", classes="section-label"), TextArea("", id="pqc-in"),
-                Label("Output:", classes="section-label"), TextArea("", id="pqc-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
     # -- Sign / Verify pane ----------------------------------------------------
     def _sign_verify_pane(self):
         sec = gpg_sec_keys()
@@ -450,52 +501,98 @@ class PGPsus(App):
                     ("Verify",       "verify"),
                 ], id="sv-mode", allow_blank=False, value="sign"),
                 Label("Key:"),
-                Select([("(auto)","")] + [(uid,fp) for uid,fp in sec], id="sv-key", allow_blank=False),
+                Select([("(auto)", "")] + [(uid, fp) for uid, fp in sec],
+                       id="sv-key", allow_blank=False),
                 Label("Passphrase:"), Input(password=True, id="sv-pass"),
-                Button("Run",  id="btn-sv",     variant="success"),
-                Button("Clear", id="btn-sv-clr", variant="default"),
+                Horizontal(
+                    Button("Run",   id="btn-sv",     variant="success"),
+                    Button("Clear", id="btn-sv-clr", variant="default"),
+                    classes="btn-row",
+                ),
+                Button("XMR Timestamp", id="btn-xmr-ts-sv", variant="default"),
                 id="sidebar",
             ),
             Vertical(
-                Label("Input:", classes="section-label"), TextArea("", id="sv-in"),
-                Label("Output:", classes="section-label"), TextArea("", id="sv-out", classes="output-area", read_only=True),
+                Label("Input:",  classes="section-label"), SafeTextArea("", id="sv-in"),
+                Label("Output:", classes="section-label"),
+                SafeTextArea("", id="sv-out", classes="output-area", read_only=True),
                 id="main-area",
             ),
         )
 
-    # -- File encrypt/decrypt pane ---------------------------------------------
+    # -- PQC Sign pane ---------------------------------------------------------
     def _pqcsign_pane(self):
         sec = gpg_sec_keys()
         return Horizontal(
             Vertical(
                 Label("Mode:"),
                 Select([
-                    ("ML-DSA-65 Keygen",       "mldsa-gen"),
-                    ("ML-DSA-65 Sign",          "mldsa-sign"),
-                    ("ML-DSA-65 Verify",        "mldsa-verify"),
-                    ("Hybrid Sign (PGP + ML-DSA-65)",   "hybrid-sign"),
-                    ("Hybrid Verify",           "hybrid-verify"),
+                    ("ML-DSA-65 Keygen     · NIST L3 · 192-bit PQ",  "mldsa-gen"),
+                    ("ML-DSA-65 Sign       · NIST L3 · 192-bit PQ",  "mldsa-sign"),
+                    ("ML-DSA-65 Verify     · NIST L3 · 192-bit PQ",  "mldsa-verify"),
+                    ("PGP + ML-DSA-65 Hybrid Sign · L3 + 128-bit",   "hybrid-sign"),
+                    ("PGP + ML-DSA-65 Hybrid Verify",                 "hybrid-verify"),
                 ], id="pqs-mode", allow_blank=False, value="mldsa-gen"),
                 Label("PGP key (hybrid sign):"),
                 Select(
                     [("(auto)", "")] + [(uid, fp) for uid, fp in sec],
                     id="pqs-pgp-key", allow_blank=False,
                 ),
-                Label("PGP passphrase:"),
-                Input(password=True, id="pqs-pgp-pass"),
-                Label("ML-DSA-65 private key:"),
-                TextArea("", id="pqs-priv-key"),
-                Label("ML-DSA-65 public key (verify):"),
-                TextArea("", id="pqs-pub-key"),
-                Button("Run",   id="btn-pqs",     variant="success"),
-                Button("Clear", id="btn-pqs-clr", variant="default"),
+                Label("PGP passphrase:"), Input(password=True, id="pqs-pgp-pass"),
+                Label("ML-DSA-65 private key:", id="pqs-priv-key-label"),
+                SafeTextArea("", id="pqs-priv-key"),
+                Label("ML-DSA-65 public key:", id="pqs-pub-key-label"),
+                SafeTextArea("", id="pqs-pub-key"),
+                Horizontal(
+                    Button("Run",   id="btn-pqs",     variant="success"),
+                    Button("Clear", id="btn-pqs-clr", variant="default"),
+                    classes="btn-row",
+                ),
+                Button("XMR Timestamp", id="btn-xmr-ts-pqs", variant="default"),
                 id="sidebar",
             ),
             Vertical(
                 Label("Input / message:", classes="section-label"),
-                TextArea("", id="pqs-in"),
+                SafeTextArea("", id="pqs-in"),
                 Label("Output:", classes="section-label"),
-                TextArea("", id="pqs-out", classes="output-area", read_only=True),
+                SafeTextArea("", id="pqs-out", classes="output-area", read_only=True),
+                id="main-area",
+            ),
+        )
+
+    @on(Select.Changed, "#pqs-mode")
+    def pqs_mode_changed(self, event: Select.Changed) -> None:
+        verify = event.value == "mldsa-verify"
+        self.query_one("#pqs-priv-key-label", Label).update(
+            "ML-DSA-65 signature (verify):" if verify else "ML-DSA-65 private key:"
+        )
+        self.query_one("#pqs-pub-key-label", Label).update(
+            "ML-DSA-65 public key (verify):" if verify else "ML-DSA-65 public key:"
+        )
+
+    # -- Deadman Storage pane --------------------------------------------------
+    def _deadman_pane(self):
+        pub = gpg_pub_keys()
+        pub_opts = [(uid, fp) for uid, fp in pub] if pub else [("(no GPG keys)", "")]
+        return Horizontal(
+            Vertical(
+                Label("Gateway (.onion):"),
+                Input(value=f"http://{_DM_ONION}", id="dm-gateway"),
+                Label("Tor SOCKS5 proxy:"),
+                Input(value="127.0.0.1:9050", id="dm-proxy"),
+                Label("GPG signing key:"),
+                Select(pub_opts, id="dm-gpg-key", allow_blank=False),
+                Button("Generate Mnemonic", id="btn-dm-gen",    variant="default"),
+                Button("Create Vault",      id="btn-dm-create", variant="success"),
+                Button("Clear",             id="btn-dm-clr",    variant="default"),
+                id="sidebar",
+            ),
+            Vertical(
+                Label("Mnemonic (write this down — never stored):",
+                      classes="section-label"),
+                SafeTextArea("", id="dm-mnemonic", classes="output-area"),
+                Label("Output:", classes="section-label"),
+                SafeTextArea("", id="dm-out", classes="output-area", read_only=True),
                 id="main-area",
             ),
         )
@@ -508,10 +605,10 @@ class PGPsus(App):
             Vertical(
                 Label("Mode:"),
                 Select([
-                    ("GPG Encrypt", "gpg-enc"),
-                    ("GPG Decrypt", "gpg-dec"),
-                    ("PQC Encrypt", "pqc-enc"),
-                    ("PQC Decrypt", "pqc-dec"),
+                    ("GPG Encrypt · OpenPGP",                              "gpg-enc"),
+                    ("GPG Decrypt · OpenPGP",                              "gpg-dec"),
+                    ("X25519+ML-KEM-768 Encrypt · NIST L3 · 192-bit PQ",  "pqc-enc"),
+                    ("X25519+ML-KEM-768 Decrypt · NIST L3 · 192-bit PQ",  "pqc-dec"),
                 ], id="file-mode", allow_blank=False, value="gpg-enc"),
                 Label("Source file:"),
                 Input(placeholder="/path/to/file", id="file-src"),
@@ -522,68 +619,21 @@ class PGPsus(App):
                 Label("Passphrase:"), Input(password=True, id="file-pass"),
                 Label("PQC key file:"),
                 Input(placeholder="/path/to/priv.key or pub.key", id="file-pqc-key"),
-                Button("Run", id="btn-file", variant="success"),
+                Horizontal(
+                    Button("Run",   id="btn-file",     variant="success"),
+                    Button("Clear", id="btn-file-clr", variant="default"),
+                    classes="btn-row",
+                ),
                 id="sidebar",
             ),
             Vertical(
                 Label("Status/Output:", classes="section-label"),
-                TextArea("", id="file-out", classes="output-area", read_only=True),
+                SafeTextArea("", id="file-out", classes="output-area", read_only=True),
                 id="main-area",
             ),
         )
 
-    # -- Symmetric encryption pane ---------------------------------------------
-    def _sym_pane(self):
-        return Horizontal(
-            Vertical(
-                Label("Mode:"),
-                Select([
-                    ("Encrypt", "enc"),
-                    ("Decrypt", "dec"),
-                ], id="sym-mode", allow_blank=False, value="enc"),
-                Label("Passphrase:"),  Input(password=True, id="sym-pass"),
-                Label("Confirm pass:"), Input(password=True, id="sym-pass2"),
-                Label("Cipher:"),
-                Select([
-                    ("AES-256 (default)", "AES256"),
-                    ("Camellia-256",      "CAMELLIA256"),
-                    ("Twofish",           "TWOFISH"),
-                ], id="sym-cipher", allow_blank=False, value="AES256"),
-                Button("Run",   id="btn-sym",     variant="success"),
-                Button("Clear", id="btn-sym-clr", variant="default"),
-                id="sidebar",
-            ),
-            Vertical(
-                Label("Input:", classes="section-label"), TextArea("", id="sym-in"),
-                Label("Output:", classes="section-label"), TextArea("", id="sym-out", classes="output-area", read_only=True),
-                id="main-area",
-            ),
-        )
-
-    # -- Keys pane -------------------------------------------------------------
-    def _keys_pane(self):
-        return VerticalScroll(
-            TextArea(self._keys_text(), id="keys-text", read_only=True),
-            Button("Refresh", id="btn-keys-refresh", variant="default"),
-            # Keyserver lookup
-            Label("Keyserver lookup:", classes="section-label"),
-            Input(placeholder="email or fingerprint", id="ks-query"),
-            Button("Search",        id="btn-ks-search", variant="default"),
-            Button("Fetch & Import", id="btn-ks-fetch",  variant="success"),
-            TextArea("", id="ks-out", read_only=True),
-            # Import
-            Label("Import key (paste block):", classes="section-label"),
-            TextArea("", id="keys-import-text"),
-            Button("Import", id="btn-keys-import", variant="success"),
-            # Export
-            Label("Export key:", classes="section-label"),
-            Input(placeholder="fingerprint or email", id="keys-export-id"),
-            Button("Export Public", id="btn-keys-export-pub", variant="default"),
-            Button("Export Secret", id="btn-keys-export-sec", variant="warning"),
-            TextArea("", id="keys-export-out", read_only=True),
-        )
-
-    def _keys_text(self):
+    
         pub = gpg_pub_keys()
         sec = gpg_sec_keys()
         lines = ["GPG PUBLIC KEYS", "="*50]
@@ -605,7 +655,7 @@ class PGPsus(App):
         return Vertical(
             Horizontal(
                 Label("Mode:"),
-                Select([("PGP Encrypt", "pgp"), ("PQC Encrypt (X25519+ML-KEM-768)", "pqc")],
+                Select([("PGP Encrypt · OpenPGP", "pgp"), ("X25519+ML-KEM-768 Encrypt · NIST L3 · 192-bit PQ", "pqc")],
                        id="enc-mode", allow_blank=False, value="pgp"),
                 classes="mode-bar",
             ),
@@ -617,14 +667,17 @@ class PGPsus(App):
                     Select([("(none)", "")] + [(uid, fp) for uid, fp in sec],
                            id="enc-signer", allow_blank=False),
                     Label("Passphrase (signing):"), Input(password=True, id="enc-pass"),
-                    Button("Encrypt", id="btn-enc",     variant="success"),
-                    Button("Clear",   id="btn-enc-clr", variant="default"),
+                    Horizontal(
+                        Button("Encrypt", id="btn-enc",     variant="success"),
+                        Button("Clear",   id="btn-enc-clr", variant="default"),
+                        classes="btn-row",
+                    ),
                     id="sidebar",
                 ),
                 Vertical(
-                    Label("Plaintext:",   classes="section-label"), TextArea("", id="enc-in"),
+                    Label("Plaintext:",   classes="section-label"), SafeTextArea("", id="enc-in"),
                     Label("Ciphertext:", classes="section-label"),
-                    TextArea("", id="enc-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="enc-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="enc-section-pgp", classes="tab-section",
@@ -637,18 +690,21 @@ class PGPsus(App):
                         ("Decrypt",          "dec"),
                         ("Generate keypair", "gen"),
                     ], id="pqc-mode", allow_blank=False, value="enc"),
-                    Label("Public key (encrypt):"),  TextArea("", id="pqc-pub-key"),
+                    Label("Public key (paste key or full bundle):"),  SafeTextArea("", id="pqc-pub-key"),
                     Label("Private key (decrypt):"),
                     Input(placeholder="/path/or/paste below", id="pqc-priv-path"),
-                    TextArea("", id="pqc-priv-key"),
-                    Button("Run",   id="btn-pqc",     variant="success"),
-                    Button("Clear", id="btn-pqc-clr", variant="default"),
+                    SafeTextArea("", id="pqc-priv-key"),
+                    Horizontal(
+                        Button("Run",   id="btn-pqc",     variant="success"),
+                        Button("Clear", id="btn-pqc-clr", variant="default"),
+                        classes="btn-row",
+                    ),
                     id="sidebar",
                 ),
                 Vertical(
-                    Label("Input:",  classes="section-label"), TextArea("", id="pqc-in"),
+                    Label("Input:",  classes="section-label"), SafeTextArea("", id="pqc-in"),
                     Label("Output:", classes="section-label"),
-                    TextArea("", id="pqc-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="pqc-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="enc-section-pqc", classes="tab-section hidden",
@@ -680,15 +736,18 @@ class PGPsus(App):
                     Select([("(auto)", "")] + [(uid, fp) for uid, fp in sec],
                            id="dec-key", allow_blank=False),
                     Label("Passphrase:"), Input(password=True, id="dec-pass"),
-                    Button("Decrypt", id="btn-dec",     variant="success"),
-                    Button("Clear",   id="btn-dec-clr", variant="default"),
+                    Horizontal(
+                        Button("Decrypt", id="btn-dec",     variant="success"),
+                        Button("Clear",   id="btn-dec-clr", variant="default"),
+                        classes="btn-row",
+                    ),
                     id="sidebar",
                 ),
                 Vertical(
                     Label("Ciphertext (paste):", classes="section-label"),
-                    TextArea("", id="dec-in"),
+                    SafeTextArea("", id="dec-in"),
                     Label("Plaintext:", classes="section-label"),
-                    TextArea("", id="dec-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="dec-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="dec-section-pgp", classes="tab-section",
@@ -696,18 +755,21 @@ class PGPsus(App):
             Horizontal(
                 Vertical(
                     Label("Passphrase (GPG):"), Input(password=True, id="batch-pass"),
-                    Label("PQC key file (optional):"),
-                    Input(placeholder="/path/to/priv.key", id="batch-pqc-key"),
+                    Label("PQC key files (one path per line):"),
+                    SafeTextArea("", id="batch-pqc-keys", classes="batch-pqc-keys"),
                     Label("Separator:"), Input(value="-"*20, id="batch-sep"),
-                    Button("Decrypt All", id="btn-batch",     variant="success"),
-                    Button("Clear",       id="btn-batch-clr", variant="default"),
+                    Horizontal(
+                        Button("Decrypt All", id="btn-batch",     variant="success"),
+                        Button("Clear",       id="btn-batch-clr", variant="default"),
+                        classes="btn-row",
+                    ),
                     id="sidebar",
                 ),
                 Vertical(
                     Label("Paste PGP/PQC blocks here:", classes="section-label"),
-                    TextArea("", id="batch-in"),
+                    SafeTextArea("", id="batch-in"),
                     Label("Results:", classes="section-label"),
-                    TextArea("", id="batch-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="batch-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="dec-section-batch", classes="tab-section hidden",
@@ -727,14 +789,17 @@ class PGPsus(App):
                         ("Camellia-256",      "CAMELLIA256"),
                         ("Twofish",           "TWOFISH"),
                     ], id="sym-cipher", allow_blank=False, value="AES256"),
-                    Button("Run",   id="btn-sym",     variant="success"),
-                    Button("Clear", id="btn-sym-clr", variant="default"),
+                    Horizontal(
+                        Button("Run",   id="btn-sym",     variant="success"),
+                        Button("Clear", id="btn-sym-clr", variant="default"),
+                        classes="btn-row",
+                    ),
                     id="sidebar",
                 ),
                 Vertical(
-                    Label("Input:",  classes="section-label"), TextArea("", id="sym-in"),
+                    Label("Input:",  classes="section-label"), SafeTextArea("", id="sym-in"),
                     Label("Output:", classes="section-label"),
-                    TextArea("", id="sym-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="sym-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="dec-section-sym", classes="tab-section hidden",
@@ -758,35 +823,50 @@ class PGPsus(App):
                 classes="mode-bar",
             ),
             VerticalScroll(
-                TextArea(self._keys_text(), id="keys-text", read_only=True),
+                SafeTextArea(self._keys_text(), id="keys-text", read_only=True),
                 Button("Refresh", id="btn-keys-refresh", variant="default"),
                 Label("Keyserver lookup:", classes="section-label"),
                 Input(placeholder="email or fingerprint", id="ks-query"),
                 Button("Search",         id="btn-ks-search", variant="default"),
                 Button("Fetch & Import", id="btn-ks-fetch",  variant="success"),
-                TextArea("", id="ks-out", read_only=True),
+                SafeTextArea("", id="ks-out", read_only=True),
                 Label("Import key (paste block):", classes="section-label"),
-                TextArea("", id="keys-import-text"),
+                SafeTextArea("", id="keys-import-text"),
                 Button("Import", id="btn-keys-import", variant="success"),
-                Label("Export key:", classes="section-label"),
+                SafeTextArea("", id="keys-import-out", read_only=True),
+                Label("Export PGP key:", classes="section-label"),
                 Input(placeholder="fingerprint or email", id="keys-export-id"),
+                Input(placeholder="passphrase (required for secret key export)", password=True, id="keys-export-pass"),
                 Button("Export Public", id="btn-keys-export-pub", variant="default"),
                 Button("Export Secret", id="btn-keys-export-sec", variant="warning"),
-                TextArea("", id="keys-export-out", read_only=True),
+                SafeTextArea("", id="keys-export-out", read_only=True),
+                Label("Dump hybrid signing key bundle (PGP + ML-DSA-65):", classes="section-label"),
+                Input(placeholder="PGP fingerprint or email", id="bundle-dump-pgp-id"),
+                Input(placeholder="Path to ML-DSA-65 key file (contains public or private block)", id="bundle-dump-mldsa-path"),
+                Input(placeholder="PGP passphrase (required for private bundle)", password=True, id="bundle-dump-pass"),
+                Horizontal(
+                    Button("Public Bundle",  id="btn-bundle-pub",  variant="default"),
+                    Button("Private Bundle", id="btn-bundle-priv", variant="warning"),
+                    Button("Full Bundle",    id="btn-bundle-full", variant="error"),
+                ),
+                SafeTextArea("", id="bundle-dump-out", read_only=True),
                 id="keys-section-list", classes="tab-section",
             ),
             Horizontal(
                 Vertical(
                     Label("Key type:"),
                     Select([
-                        ("Ed25519 (recommended)",          "ed25519"),
-                        ("RSA 4096",                       "rsa4096"),
-                        ("RSA 2048",                       "rsa2048"),
-                        ("PQC Encrypt Key (X25519+ML-KEM-768)", "pqc"),
-                        ("PGP + ML-DSA-65 (hybrid signing)", "pgp-mldsa"),
+                        ("Ed25519  · 128-bit · EdDSA",                              "ed25519"),
+                        ("RSA-4096 · 140-bit classical",                             "rsa4096"),
+                        ("RSA-2048 · 112-bit classical",                             "rsa2048"),
+                        ("X25519+ML-KEM-768 · NIST L3 · 192-bit PQ enc",            "pqc"),
+                        ("PGP+ML-DSA-65 hybrid sign · Ed25519 + NIST L3",           "pgp-mldsa"),
+                        ("PGP+X25519+ML-KEM-768 hybrid · new both · NIST L3",       "pgp-pqc-new"),
+                        ("PGP+X25519+ML-KEM-768 hybrid · existing PGP + new PQC",   "pgp-pqc-existing"),
+                        ("PGP+X25519+ML-KEM-768 hybrid · paste both keys",          "pgp-pqc-paste"),
                     ], id="kg-type", allow_blank=False, value="ed25519"),
                     Label("Real name:"),    Input(placeholder="Alice", id="kg-name"),
-                    Label("Email:"),        Input(placeholder="alice@example.com", id="kg-email"),
+                    Label("Email (optional):"), Input(placeholder="alice@example.com", id="kg-email"),
                     Label("Passphrase:"),   Input(password=True, id="kg-pass"),
                     Label("Confirm pass:"), Input(password=True, id="kg-pass2"),
                     Label("Expires (GPG):"),
@@ -796,12 +876,20 @@ class PGPsus(App):
                         ("2 years",  "2y"),
                         ("6 months", "6m"),
                     ], id="kg-expire", allow_blank=False, value="0"),
+                    # shown only for pgp-pqc-existing
+                    Label("Existing PGP key:", id="kg-existing-label", classes="hidden section-label"),
+                    Select([], id="kg-existing-pgp", allow_blank=True, classes="hidden"),
+                    # shown only for pgp-pqc-paste
+                    Label("Paste PGP private key:", id="kg-paste-pgp-label", classes="hidden section-label"),
+                    SafeTextArea("", id="kg-paste-pgp", classes="hidden"),
+                    Label("Paste PQC private key:", id="kg-paste-pqc-label", classes="hidden section-label"),
+                    SafeTextArea("", id="kg-paste-pqc", classes="hidden"),
                     Button("Generate", id="btn-kg", variant="success"),
                     id="sidebar",
                 ),
                 Vertical(
                     Label("Output:", classes="section-label"),
-                    TextArea("", id="kg-out", classes="output-area", read_only=True),
+                    SafeTextArea("", id="kg-out", classes="output-area", read_only=True),
                     id="main-area",
                 ),
                 id="keys-section-gen", classes="tab-section hidden",
@@ -814,6 +902,26 @@ class PGPsus(App):
         self.query_one("#keys-section-list").display = (event.value == "list")
         self.query_one("#keys-section-gen").display  = (event.value == "gen")
 
+    @on(Select.Changed, "#kg-type")
+    def kg_type_changed(self, event: Select.Changed) -> None:
+        v = event.value
+        existing = v == "pgp-pqc-existing"
+        paste    = v == "pgp-pqc-paste"
+        # name/email/pass/expire only needed for new-key types
+        needs_identity = v not in ("pgp-pqc-existing", "pgp-pqc-paste")
+        for wid in ("#kg-name", "#kg-email", "#kg-pass", "#kg-pass2", "#kg-expire"):
+            self.query_one(wid).display = needs_identity
+        for wid in ("#kg-existing-label", "#kg-existing-pgp"):
+            self.query_one(wid).display = existing
+        for wid in ("#kg-paste-pgp-label", "#kg-paste-pgp", "#kg-paste-pqc-label", "#kg-paste-pqc"):
+            self.query_one(wid).display = paste
+        if existing:
+            # populate the select with current GPG secret keys
+            sec = gpg_sec_keys()
+            opts = [(uid, fp) for uid, fp in sec] if sec else [("(no secret keys)", "")]
+            sel = self.query_one("#kg-existing-pgp", Select)
+            sel.set_options(opts)
+
     # -- Helpers ---------------------------------------------------------------
     def set_status(self, msg: str, ok: bool = True):
         bar = self.query_one("#status-bar", Label)
@@ -823,6 +931,58 @@ class PGPsus(App):
 
     def action_tab(self, tab_id: str):
         self.query_one("#tabs", TabbedContent).active = tab_id
+
+    def _xmr_timestamp_into(self, target_id: str):
+        """Fetch latest XMR block and prepend it into target TextArea."""
+        self.set_status("Fetching XMR block...")
+        def fetch():
+            text = xmr_latest_block()
+            def apply():
+                ta = self.query_one(target_id, TextArea)
+                existing = ta.text.strip()
+                ta.load_text(text + ("\n\n" + existing if existing else ""))
+                self.set_status("XMR block fetched.")
+            self.call_from_thread(apply)
+        threading.Thread(target=fetch, daemon=True).start()
+
+    @on(Button.Pressed, "#btn-xmr-ts-sv")
+    def xmr_ts_sv(self):  self._xmr_timestamp_into("#sv-in")
+
+    @on(Button.Pressed, "#btn-xmr-ts-pqs")
+    def xmr_ts_pqs(self): self._xmr_timestamp_into("#pqs-in")
+
+    _RESIZE_STEP = 3
+    _RESIZE_MIN  = 3
+
+    def action_resize_up(self):
+        """Alt+Up: make focused TextArea taller."""
+        w = self.focused
+        if isinstance(w, TextArea):
+            current = w.styles.height
+            h = int(current.value) if (current and current.unit.name == "CELLS") else 10
+            w.styles.height = max(self._RESIZE_MIN, h + self._RESIZE_STEP)
+
+    def action_resize_down(self):
+        """Alt+Down: make focused TextArea shorter."""
+        w = self.focused
+        if isinstance(w, TextArea):
+            current = w.styles.height
+            h = int(current.value) if (current and current.unit.name == "CELLS") else 10
+            w.styles.height = max(self._RESIZE_MIN, h - self._RESIZE_STEP)
+
+    def action_resize_left(self):
+        """Alt+Left: narrow the sidebar."""
+        for sb in self.query("#sidebar"):
+            current = sb.styles.width
+            w = int(current.value) if (current and current.unit.name == "CELLS") else 32
+            sb.styles.width = max(16, w - self._RESIZE_STEP)
+
+    def action_resize_right(self):
+        """Alt+Right: widen the sidebar."""
+        for sb in self.query("#sidebar"):
+            current = sb.styles.width
+            w = int(current.value) if (current and current.unit.name == "CELLS") else 32
+            sb.styles.width = min(80, w + self._RESIZE_STEP)
 
     def _refresh_all_key_selects(self):
         """Rebuild all key-related Select/SelectionList widgets after keyring changes."""
@@ -841,10 +1001,12 @@ class PGPsus(App):
             pass
 
         for widget_id, opts in [
-            ("#enc-signer",  sec_opts),
-            ("#dec-key",     sec_auto),
-            ("#sv-key",      sec_auto),
-            ("#file-key",    pub_opts),
+            ("#enc-signer",   sec_opts),
+            ("#dec-key",      sec_auto),
+            ("#sv-key",       sec_auto),
+            ("#file-key",     pub_opts),
+            ("#pqs-pgp-key",  sec_auto),
+            ("#kg-existing-pgp", sec_opts),
         ]:
             try:
                 self.query_one(widget_id, Select).set_options(opts)
@@ -852,7 +1014,7 @@ class PGPsus(App):
                 pass
 
         try:
-            self.query_one("#keys-text", TextArea).load_text(self._keys_text())
+            self.query_one("#keys-text", SafeTextArea).load_text(self._keys_text())
         except Exception:
             pass
 
@@ -892,17 +1054,21 @@ class PGPsus(App):
 
     @on(Button.Pressed, "#btn-batch")
     def do_batch(self):
-        raw = self.query_one("#batch-in", TextArea).text
+        raw = self.query_one("#batch-in",   TextArea).text
         pp  = self.query_one("#batch-pass", Input).value
-        sep = self.query_one("#batch-sep", Input).value
-        pqc_priv_path = self.query_one("#batch-pqc-key", Input).value.strip()
+        sep = self.query_one("#batch-sep",  Input).value
+        # Multi-key: one file path per line
+        key_paths = [p.strip() for p in
+                     self.query_one("#batch-pqc-keys", TextArea).text.splitlines()
+                     if p.strip()]
 
-        pqc_priv = None
-        if pqc_priv_path:
+        pqc_privs = []
+        for path in key_paths:
             try:
-                pqc_priv = hybrid_crypto.parse_private_key(Path(pqc_priv_path).read_text())
+                pqc_privs.append(hybrid_crypto.parse_private_key(Path(path).read_text()))
             except Exception as e:
-                self.set_status(f"PQC key load failed: {e}", ok=False)
+                self.set_status(f"PQC key load failed ({path}): {e}", ok=False)
+                return
 
         pgp_blocks = PGP_BLOCK_RE.findall(raw)
         hyb_blocks = HYB_BLOCK_RE.findall(raw)
@@ -910,58 +1076,219 @@ class PGPsus(App):
         if not total:
             return self.set_status("No PGP or PQC blocks found.", ok=False)
 
-        results = []
+        results  = []
         ok_count = 0
 
         for i, block in enumerate(pgp_blocks, 1):
             r = gpg.decrypt(block, passphrase=pp or None, always_trust=True)
             if r.ok:
                 ok_count += 1
-                results.append(f"[GPG {i}/{len(pgp_blocks)}]  {r.username or 'unsigned'}\n{str(r)}")
+                results.append(f"[GPG {i}/{len(pgp_blocks)}]  OK  ({r.username or 'unsigned'})\n{str(r)}")
             else:
-                results.append(f"[GPG {i}/{len(pgp_blocks)}]  {r.status}\n{r.stderr.strip()}")
+                results.append(f"[GPG {i}/{len(pgp_blocks)}]  FAIL  {r.status}\n{r.stderr.strip()}")
 
         for i, block in enumerate(hyb_blocks, 1):
-            if not pqc_priv:
-                results.append(f"[PQC {i}/{len(hyb_blocks)}]  No PQC private key provided")
+            if not pqc_privs:
+                results.append(f"[PQC {i}/{len(hyb_blocks)}]  SKIP  No PQC private key provided")
                 continue
-            try:
-                pt = hybrid_crypto.decrypt(block, pqc_priv)
-                ok_count += 1
-                results.append(f"[PQC {i}/{len(hyb_blocks)}] \n{pt}")
-            except Exception as e:
-                results.append(f"[PQC {i}/{len(hyb_blocks)}]  {e}")
+            decrypted = False
+            for priv in pqc_privs:
+                try:
+                    pt = hybrid_crypto.decrypt(block, priv)
+                    ok_count += 1
+                    results.append(f"[PQC {i}/{len(hyb_blocks)}]  OK\n{pt}")
+                    decrypted = True
+                    break
+                except Exception:
+                    continue
+            if not decrypted:
+                results.append(f"[PQC {i}/{len(hyb_blocks)}]  FAIL  None of the {len(pqc_privs)} key(s) worked")
 
         self.query_one("#batch-out", TextArea).load_text(f"\n{sep}\n".join(results))
         self.set_status(f"Batch: {ok_count}/{total} decrypted OK")
 
+    @staticmethod
+    def _gpg_batch(key_type: str, name: str, email: str, expire: str, passphrase) -> str:
+        """Build a correct GPG batch key-gen input string, bypassing gen_key_input's
+        broken EDDSA handling (it adds Key-Length which is invalid for curve keys)."""
+        lines = []
+        if key_type == "EDDSA":
+            lines += [
+                "Key-Type: EDDSA",
+                "Key-Curve: Ed25519",
+                "Key-Usage: sign",
+                "Subkey-Type: ECDH",
+                "Subkey-Curve: Curve25519",
+                "Subkey-Usage: encrypt",
+            ]
+        else:
+            lines += [f"Key-Type: {key_type}"]
+        lines.append(f"Name-Real: {name}")
+        if email:
+            lines.append(f"Name-Email: {email}")
+        lines.append(f"Expire-Date: {expire or '0'}")
+        if passphrase:
+            lines.append(f"Passphrase: {passphrase}")
+        else:
+            lines.append("%no-protection")
+        lines.append("%commit")
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _identity(name: str, email: str) -> str:
+        return f"{name} <{email}>" if email else name
+
+    @staticmethod
+    def _extract_pqc_pub(text: str) -> str:
+        """Extract X25519+ML-KEM-768 PUBLIC KEY block from a full bundle or return text as-is."""
+        if "BEGIN X25519+ML-KEM-768 PUBLIC KEY BUNDLE" in text:
+            m = re.search(
+                r"(-----BEGIN X25519\+ML-KEM-768 PUBLIC KEY-----.*?-----END X25519\+ML-KEM-768 PUBLIC KEY-----)",
+                text, re.DOTALL
+            )
+            if m:
+                return m.group(1).strip()
+        return text
+
     @on(Button.Pressed, "#btn-kg")
     def do_keygen(self):
         ktype  = self.query_one("#kg-type",   Select).value
+        out    = self.query_one("#kg-out", TextArea)
+
+        # ── PGP + PQC-E hybrid: generate both from scratch ────────────────────
+        if ktype == "pgp-pqc-new":
+            name   = self.query_one("#kg-name",  Input).value.strip()
+            email  = self.query_one("#kg-email", Input).value.strip()
+            pp     = self.query_one("#kg-pass",  Input).value
+            pp2    = self.query_one("#kg-pass2", Input).value
+            expire = self.query_one("#kg-expire", Select).value
+            if not name:
+                return self.set_status("Name required.", ok=False)
+            if pp != pp2:
+                return self.set_status("Passphrases don't match.", ok=False)
+            try:
+                inp = self._gpg_batch("EDDSA", name, email, expire, pp or None)
+                self.set_status("Generating PGP component...")
+                key = gpg.gen_key(inp)
+                if not key.fingerprint:
+                    out.load_text(f"GPG key generation failed.\n{key.stderr}")
+                    return self.set_status("GPG key generation failed.", ok=False)
+                pgp_pub = gpg.export_keys(key.fingerprint, armor=True)
+                pqc_pub, pqc_priv = hybrid_crypto.generate_keypair()
+                pqc_pub_arm = hybrid_crypto.armor_public_key(pqc_pub)
+                combined_pub = (
+                    f"-----BEGIN X25519+ML-KEM-768 PUBLIC KEY BUNDLE-----\n"
+                    f"PGP-Fingerprint: {key.fingerprint}\n"
+                    f"Identity: {self._identity(name, email)}\n\n"
+                    f"{pgp_pub}\n\n"
+                    f"{pqc_pub_arm}\n"
+                    f"-----END X25519+ML-KEM-768 PUBLIC KEY BUNDLE-----"
+                )
+                result = (
+                    f"PGP + X25519+ML-KEM-768 Hybrid Key Bundle\n"
+                    f"Identity: {self._identity(name, email)}\n"
+                    f"{'='*50}\n\n"
+                    f"--- PGP COMPONENT (Ed25519 · 128-bit) ---\n"
+                    f"Fingerprint: {key.fingerprint}\n\n"
+                    f"{pgp_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"--- X25519+ML-KEM-768 COMPONENT (NIST L3 · 192-bit PQ) ---\n\n"
+                    f"{pqc_pub_arm}\n\n"
+                    f"{'='*50}\n"
+                    f"--- COMBINED PUBLIC KEY (share this) ---\n\n"
+                    f"{combined_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"X25519+ML-KEM-768 PRIVATE KEY (do not share):\n\n"
+                    f"{hybrid_crypto.armor_private_key(pqc_priv)}"
+                )
+                out.load_text(result)
+                self.set_status(f"PGP+X25519+ML-KEM-768 bundle generated: {key.fingerprint[-16:]}")
+            except Exception as e:
+                out.load_text(f"ERROR: {e}")
+                self.set_status(f"Keygen failed: {e}", ok=False)
+            return
+
+        # ── PGP + PQC-E hybrid: existing PGP key + new PQC half ───────────────
+        if ktype == "pgp-pqc-existing":
+            fp = self.query_one("#kg-existing-pgp", Select).value
+            if not fp:
+                return self.set_status("Select an existing PGP key.", ok=False)
+            try:
+                pgp_pub = gpg.export_keys(fp, armor=True)
+                pqc_pub, pqc_priv = hybrid_crypto.generate_keypair()
+                uid = next((u for k in gpg.list_keys() if k["fingerprint"] == fp for u in k["uids"]), fp)
+                pqc_pub_arm = hybrid_crypto.armor_public_key(pqc_pub)
+                combined_pub = (
+                    f"-----BEGIN X25519+ML-KEM-768 PUBLIC KEY BUNDLE-----\n"
+                    f"PGP-Fingerprint: {fp}\n"
+                    f"Identity: {uid}\n\n"
+                    f"{pgp_pub}\n\n"
+                    f"{pqc_pub_arm}\n"
+                    f"-----END X25519+ML-KEM-768 PUBLIC KEY BUNDLE-----"
+                )
+                result = (
+                    f"PGP + X25519+ML-KEM-768 Hybrid Key Bundle\n"
+                    f"Identity: {uid}\n"
+                    f"{'='*50}\n\n"
+                    f"--- PGP COMPONENT (existing · 128-bit) ---\n"
+                    f"Fingerprint: {fp}\n\n"
+                    f"{pgp_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"--- X25519+ML-KEM-768 COMPONENT (NIST L3 · 192-bit PQ) ---\n\n"
+                    f"{pqc_pub_arm}\n\n"
+                    f"{'='*50}\n"
+                    f"--- COMBINED PUBLIC KEY (share this) ---\n\n"
+                    f"{combined_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"X25519+ML-KEM-768 PRIVATE KEY (do not share):\n\n"
+                    f"{hybrid_crypto.armor_private_key(pqc_priv)}"
+                )
+                out.load_text(result)
+                self.set_status(f"PGP+X25519+ML-KEM-768 bundle generated from existing PGP key {fp[-16:]}")
+            except Exception as e:
+                out.load_text(f"ERROR: {e}")
+                self.set_status(f"Keygen failed: {e}", ok=False)
+            return
+
+        # ── PGP + X25519+ML-KEM-768: paste both existing keys ─────────────────
+        if ktype == "pgp-pqc-paste":
+            pgp_block = self.query_one("#kg-paste-pgp", TextArea).text.strip()
+            pqc_block = self.query_one("#kg-paste-pqc", TextArea).text.strip()
+            if not pgp_block:
+                return self.set_status("Paste a PGP private key block.", ok=False)
+            if not pqc_block:
+                return self.set_status("Paste an X25519+ML-KEM-768 private key block.", ok=False)
+            try:
+                result = (
+                    f"PGP + X25519+ML-KEM-768 Hybrid Key Bundle (from existing keys)\n"
+                    f"{'='*50}\n\n"
+                    f"--- PGP COMPONENT ---\n\n"
+                    f"{pgp_block}\n\n"
+                    f"{'='*50}\n"
+                    f"--- X25519+ML-KEM-768 COMPONENT ---\n\n"
+                    f"{pqc_block}"
+                )
+                out.load_text(result)
+                self.set_status("PGP+X25519+ML-KEM-768 bundle assembled from pasted keys.")
+            except Exception as e:
+                out.load_text(f"ERROR: {e}")
+                self.set_status(f"Bundle failed: {e}", ok=False)
+            return
+
         name   = self.query_one("#kg-name",   Input).value.strip()
         email  = self.query_one("#kg-email",  Input).value.strip()
         pp     = self.query_one("#kg-pass",   Input).value
         pp2    = self.query_one("#kg-pass2",  Input).value
         expire = self.query_one("#kg-expire", Select).value
 
-        if not name or not email:
-            return self.set_status("Name and email required.", ok=False)
+        if not name:
+            return self.set_status("Name required.", ok=False)
         if pp != pp2:
             return self.set_status("Passphrases don't match.", ok=False)
 
-        out = self.query_one("#kg-out", TextArea)
-
         if ktype == "pgp-mldsa":
-            if not name or not email:
-                return self.set_status("Name and email required.", ok=False)
-            if pp != pp2:
-                return self.set_status("Passphrases don't match.", ok=False)
             try:
-                inp_kw = dict(
-                    key_type="EDDSA", name_real=name, name_email=email,
-                    expire_date=expire, passphrase=pp or None,
-                )
-                inp = gpg.gen_key_input(**inp_kw)
+                inp = self._gpg_batch("EDDSA", name, email, expire, pp or None)
                 self.set_status("Generating GPG component...")
                 key = gpg.gen_key(inp)
                 if not key.fingerprint:
@@ -969,9 +1296,18 @@ class PGPsus(App):
                     return self.set_status("GPG key generation failed.", ok=False)
                 pgp_pub = gpg.export_keys(key.fingerprint, armor=True)
                 mldsa_pub, mldsa_priv = pqsign_crypto.generate_keypair()
+                ident = self._identity(name, email)
+                pub_bundle = (
+                    f"-----BEGIN PGP+ML-DSA-65 SIGNING KEY BUNDLE-----\n"
+                    f"PGP-Fingerprint: {key.fingerprint}\n"
+                    f"Identity: {ident}\n\n"
+                    f"{pgp_pub.strip()}\n\n"
+                    f"{mldsa_pub.strip()}\n"
+                    f"-----END PGP+ML-DSA-65 SIGNING KEY BUNDLE-----"
+                )
                 result = (
                     f"PGP + ML-DSA-65 Hybrid Signing Key Bundle\n"
-                    f"Identity: {name} <{email}>\n"
+                    f"Identity: {ident}\n"
                     f"{'='*50}\n\n"
                     f"--- PGP COMPONENT (Ed25519) ---\n"
                     f"Fingerprint: {key.fingerprint}\n\n"
@@ -979,6 +1315,9 @@ class PGPsus(App):
                     f"{'='*50}\n"
                     f"--- ML-DSA-65 COMPONENT ---\n\n"
                     f"{mldsa_pub}\n\n"
+                    f"{'='*50}\n"
+                    f"--- COMBINED PUBLIC BUNDLE (paste this into Deadman) ---\n\n"
+                    f"{pub_bundle}\n\n"
                     f"{'='*50}\n"
                     f"ML-DSA-65 PRIVATE KEY (do not share):\n\n"
                     f"{mldsa_priv}"
@@ -996,16 +1335,16 @@ class PGPsus(App):
                 pub_arm  = hybrid_crypto.armor_public_key(pub)
                 priv_arm = hybrid_crypto.armor_private_key(priv)
                 result = (
-                    f"PQC Hybrid Key (X25519 + ML-KEM-768)\n"
+                    f"X25519+ML-KEM-768 Encryption Key\n"
                     f"Identity: {name} <{email}>\n"
                     f"{'='*50}\n\n"
                     f"{pub_arm}\n\n"
                     f"{'='*50}\n"
-                    f"PRIVATE KEY (do not share):\n\n"
+                    f"X25519+ML-KEM-768 PRIVATE KEY (do not share):\n\n"
                     f"{priv_arm}"
                 )
                 out.load_text(result)
-                self.set_status("PQC keypair generated. Save private key securely!")
+                self.set_status("X25519+ML-KEM-768 keypair generated. Save private key securely!")
             except Exception as e:
                 out.load_text(f"ERROR: {e}")
                 self.set_status(f"PQC keygen failed: {e}", ok=False)
@@ -1014,21 +1353,22 @@ class PGPsus(App):
         # GPG key
         key_map = {"ed25519": ("EDDSA",""), "rsa4096": ("RSA","4096"), "rsa2048": ("RSA","2048")}
         key_type, key_len = key_map[ktype]
-        inp_kw = dict(
-            key_type=key_type, name_real=name, name_email=email,
-            expire_date=expire, passphrase=pp or None,
-        )
-        if key_len:
-            inp_kw["key_length"] = int(key_len)
-
-        inp = gpg.gen_key_input(**inp_kw)
+        if key_type == "EDDSA":
+            inp = self._gpg_batch("EDDSA", name, email, expire, pp or None)
+        else:
+            inp_kw = dict(
+                key_type=key_type, name_real=name, name_email=email,
+                expire_date=expire, passphrase=pp or None,
+                key_length=int(key_len),
+            )
+            inp = gpg.gen_key_input(**inp_kw)
         self.set_status("Generating key (may take a moment)")
         key = gpg.gen_key(inp)
         if key.fingerprint:
             out.load_text(
                 f"GPG key generated!\n"
                 f"Type:        {ktype}\n"
-                f"Identity:    {name} <{email}>\n"
+                f"Identity:    {self._identity(name, email)}\n"
                 f"Fingerprint: {key.fingerprint}\n"
                 f"Expires:     {expire if expire != '0' else 'never'}\n\n"
                 f"Export public key:\n  gpg --armor --export {key.fingerprint}\n\n"
@@ -1064,12 +1404,13 @@ class PGPsus(App):
             if not pub_text: return self.set_status("Paste public key in left panel.", ok=False)
             if not inp:      return self.set_status("No plaintext to encrypt.", ok=False)
             try:
-                pub = hybrid_crypto.parse_public_key(pub_text)
+                pub = hybrid_crypto.parse_public_key(self._extract_pqc_pub(pub_text))
                 ct  = hybrid_crypto.encrypt(inp, pub)
                 out.load_text(ct)
                 self.set_status("PQC encrypted OK.")
             except Exception as e:
-                self.set_status(f"PQC encrypt error: {e}", ok=False)
+                out.load_text(f"ERROR: {e}")
+                self.set_status(f"PQC encrypt failed: {e}", ok=False)
 
         elif mode == "dec":
             priv_path = self.query_one("#pqc-priv-path", Input).value.strip()
@@ -1119,7 +1460,6 @@ class PGPsus(App):
         elif mode == "verify":
             result = gpg.verify(text)
             if result.valid:
-                import datetime
                 ts = ""
                 try:
                     ts = datetime.datetime.utcfromtimestamp(float(result.timestamp)).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -1211,30 +1551,29 @@ class PGPsus(App):
                 return self.set_status("Paste ML-DSA-65 private key.", ok=False)
             if not msg:
                 return self.set_status("No message to sign.", ok=False)
+            if not pub_txt:
+                return self.set_status("Paste ML-DSA-65 public key.", ok=False)
+                return self.set_status("Paste ML-DSA-65 public key.", ok=False)
             try:
+                out.load_text("Signing with PGP...")
                 # PGP clearsign
                 kw = dict(clearsign=True, passphrase=pgp_pp or None)
                 if pgp_fp:
                     kw["keyid"] = pgp_fp
                 pgp_result = gpg.sign(msg, **kw)
                 if not str(pgp_result):
-                    return self.set_status(
-                        f"PGP sign failed: {pgp_result.status}", ok=False
-                    )
+                    out.load_text(f"ERROR: PGP sign failed.\nStatus: {pgp_result.status}\nStderr: {pgp_result.stderr}")
+                    return self.set_status(f"PGP sign failed: {pgp_result.status}", ok=False)
+                out.load_text("PGP signed. Signing with ML-DSA-65...")
                 # ML-DSA-65 signature
                 mldsa_sig = pqsign_crypto.sign_message(priv_txt, msg)
-                # Extract pub key from priv (re-derive via keygen not possible;
-                # user must supply pub key separately -- use pub_txt if provided)
-                if not pub_txt:
-                    return self.set_status(
-                        "Paste ML-DSA-65 public key for hybrid bundle.", ok=False
-                    )
                 bundle = pqsign_crypto.make_hybrid_bundle(
                     str(pgp_result), mldsa_sig, pub_txt, msg
                 )
                 out.load_text(bundle)
                 self.set_status("Hybrid signature bundle created.")
             except Exception as e:
+                out.load_text(f"ERROR: {e}")
                 self.set_status(f"Hybrid sign error: {e}", ok=False)
 
         elif mode == "hybrid-verify":
@@ -1253,7 +1592,11 @@ class PGPsus(App):
                 )
                 self.set_status("Hybrid bundle verified.")
             except Exception as e:
-                out.load_text(f"Verification failed: {e}")
+                preview = bundle[:120].replace('\n', '↵')
+                out.load_text(
+                    f"Verification failed: {e}\n\n"
+                    f"--- Input preview (first 120 chars) ---\n{preview}"
+                )
                 self.set_status(f"Hybrid verify failed: {e}", ok=False)
 
     @on(Button.Pressed, "#btn-file")
@@ -1318,8 +1661,8 @@ class PGPsus(App):
                 dst = src + ".hybrid"
             try:
                 pub_text = Path(pqc_key).read_text()
-                pub = hybrid_crypto.parse_public_key(pub_text)
-                data = Path(src).read_bytes()
+                pub      = hybrid_crypto.parse_public_key(self._extract_pqc_pub(pub_text))
+                data     = Path(src).read_bytes()
                 b64_data = base64.b64encode(data).decode("utf-8")
                 ct = hybrid_crypto.encrypt(b64_data, pub)
                 Path(dst).write_text(ct)
@@ -1351,6 +1694,13 @@ class PGPsus(App):
                 out.load_text(f"Error: {e}")
                 self.set_status(str(e), ok=False)
 
+    @on(Button.Pressed, "#btn-file-clr")
+    def file_clear(self):
+        self.query_one("#file-src", Input).value = ""
+        self.query_one("#file-dst", Input).value = ""
+        self.query_one("#file-out", TextArea).load_text("")
+        self.set_status("Cleared.")
+
     @on(Button.Pressed, "#btn-sym")
     def do_symmetric(self):
         mode    = self.query_one("#sym-mode",   Select).value
@@ -1369,7 +1719,7 @@ class PGPsus(App):
             if pp != pp2:
                 return self.set_status("Passphrases don't match.", ok=False)
             r = gpg.encrypt(
-                text_in, symmetric=True, passphrase=pp, armor=True,
+                text_in, [], symmetric=True, passphrase=pp, armor=True,
                 extra_args=["--cipher-algo", cipher],
             )
             if r.ok:
@@ -1394,13 +1744,18 @@ class PGPsus(App):
         if not query:
             return self.set_status("Enter email or fingerprint to search.", ok=False)
         try:
-            r = subprocess.run(
-                ["gpg", "--keyserver", "keys.openpgp.org",
-                 "--search-keys", query],
-                capture_output=True, text=True, timeout=30
-            )
-            output = (r.stdout + r.stderr).strip() or "(no output)"
-            self.query_one("#ks-out", TextArea).load_text(output)
+            # Use keys.openpgp.org HTTPS REST API (port 443, not HKP port 11371)
+            q = url_quote(query)
+            url = f"https://keys.openpgp.org/vks/v1/by-fingerprint/{q}" \
+                  if re.match(r'^[0-9A-Fa-f]{16,}$', query.replace(' ', '')) \
+                  else f"https://keys.openpgp.org/search?q={q}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json, text/html"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                body = r.read().decode()
+            # Strip HTML tags for readability
+            text = re.sub(r'<[^>]+>', '', body).strip()
+            text = re.sub(r'\n{3,}', '\n\n', text)
+            self.query_one("#ks-out", TextArea).load_text(text[:4000] or "(no results)")
             self.set_status("Keyserver search complete.")
         except Exception as e:
             self.query_one("#ks-out", TextArea).load_text(f"Error: {e}")
@@ -1410,19 +1765,30 @@ class PGPsus(App):
     def do_ks_fetch(self):
         query = self.query_one("#ks-query", Input).value.strip()
         if not query:
-            return self.set_status("Enter fingerprint or key ID to fetch.", ok=False)
+            return self.set_status("Enter fingerprint or email to fetch.", ok=False)
         try:
-            r = subprocess.run(
-                ["gpg", "--keyserver", "keys.openpgp.org",
-                 "--recv-keys", query],
-                capture_output=True, text=True, timeout=30
-            )
-            output = (r.stdout + r.stderr).strip() or "(no output)"
-            self.query_one("#ks-out", TextArea).load_text(output)
-            if r.returncode == 0:
-                self._refresh_all_key_selects()
+            # Use keys.openpgp.org HTTPS REST API
+            q = url_quote(query.replace(' ', '').upper())
+            if re.match(r'^[0-9A-Fa-f]{16,}$', query.replace(' ', '')):
+                url = f"https://keys.openpgp.org/vks/v1/by-fingerprint/{q}"
             else:
-                self.set_status("Fetch failed  see output.", ok=False)
+                url = f"https://keys.openpgp.org/vks/v1/by-email/{url_quote(query)}"
+            req = urllib.request.Request(url, headers={"Accept": "application/pgp-keys"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                armor = r.read().decode()
+            if "BEGIN PGP" not in armor:
+                self.query_one("#ks-out", TextArea).load_text(f"No key found for: {query}")
+                return self.set_status("Key not found.", ok=False)
+            result = gpg.import_keys(armor)
+            msg = f"Imported: {result.imported}  Unchanged: {result.unchanged}  Errors: {result.not_imported}\n"
+            if result.fingerprints:
+                msg += "Fingerprints:\n" + "\n".join(result.fingerprints)
+            self.query_one("#ks-out", TextArea).load_text(msg)
+            if result.imported:
+                self._refresh_all_key_selects()
+                self.set_status(f"Key imported: {result.fingerprints[0][-16:] if result.fingerprints else ''}")
+            else:
+                self.set_status("Fetch failed — see output.", ok=False)
         except Exception as e:
             self.query_one("#ks-out", TextArea).load_text(f"Error: {e}")
             self.set_status(str(e), ok=False)
@@ -1440,9 +1806,14 @@ class PGPsus(App):
         )
         if result.fingerprints:
             msg += "Fingerprints:\n" + "\n".join(result.fingerprints)
-        self.query_one("#keys-export-out", TextArea).load_text(msg)
+        self.query_one("#keys-import-out", TextArea).load_text(msg)
         self._refresh_all_key_selects()
-        self.set_status(f"Import: {result.imported} key(s) imported.")
+        if result.imported:
+            self.set_status(f"Imported {result.imported} key(s) — Encrypt/sign selects updated.")
+        elif result.unchanged:
+            self.set_status(f"Key already present ({result.unchanged} unchanged).", ok=False)
+        else:
+            self.set_status(f"Import failed — {result.not_imported} error(s).", ok=False)
 
     @on(Button.Pressed, "#btn-keys-export-pub")
     def do_keys_export_pub(self):
@@ -1461,17 +1832,150 @@ class PGPsus(App):
         fpr = self.query_one("#keys-export-id", Input).value.strip()
         if not fpr:
             return self.set_status("Enter fingerprint or email to export.", ok=False)
-        armor = gpg.export_keys(fpr, secret=True, armor=True)
+        pp = self.query_one("#keys-export-pass", Input).value or None
+        if pp is None:
+            return self.set_status("Enter passphrase to export secret key (GnuPG 2.1+ requirement).", ok=False)
+        armor = gpg.export_keys(fpr, secret=True, armor=True, passphrase=pp)
         if armor:
             self.query_one("#keys-export-out", TextArea).load_text(armor)
             self.set_status(f"Exported SECRET key: {fpr}  handle with care!")
         else:
-            self.set_status(f"No secret key found for: {fpr}", ok=False)
+            self.set_status(f"No secret key found for: {fpr} (wrong passphrase?)", ok=False)
+
+    def _do_bundle_dump(self, mode: str):
+        """Dump hybrid signing bundle. mode = 'pub' | 'priv' | 'full'"""
+        pgp_id   = self.query_one("#bundle-dump-pgp-id",    Input).value.strip()
+        mldsa_path = self.query_one("#bundle-dump-mldsa-path", Input).value.strip()
+        pp       = self.query_one("#bundle-dump-pass",       Input).value or None
+        out      = self.query_one("#bundle-dump-out", TextArea)
+
+        if not pgp_id:
+            return self.set_status("Enter PGP fingerprint or email.", ok=False)
+        if not mldsa_path:
+            return self.set_status("Enter path to ML-DSA-65 key file.", ok=False)
+
+        # Read ML-DSA key file
+        try:
+            mldsa_text = Path(mldsa_path).expanduser().read_text().strip()
+        except Exception as e:
+            out.load_text(f"Cannot read ML-DSA-65 key file:\n{e}")
+            return self.set_status(str(e), ok=False)
+
+        # Extract public and private blocks from key file
+        mldsa_pub = mldsa_priv = ""
+        pub_m = re.search(
+            r'(-----BEGIN ML-DSA-65 PUBLIC KEY-----.*?-----END ML-DSA-65 PUBLIC KEY-----)',
+            mldsa_text, re.DOTALL)
+        priv_m = re.search(
+            r'(-----BEGIN ML-DSA-65 PRIVATE KEY-----.*?-----END ML-DSA-65 PRIVATE KEY-----)',
+            mldsa_text, re.DOTALL)
+        if pub_m:
+            mldsa_pub = pub_m.group(1).strip()
+        if priv_m:
+            mldsa_priv = priv_m.group(1).strip()
+
+        if mode in ("pub", "full") and not mldsa_pub:
+            out.load_text("No -----BEGIN ML-DSA-65 PUBLIC KEY----- block found in file.")
+            return self.set_status("ML-DSA-65 public key not found in file.", ok=False)
+        if mode in ("priv", "full") and not mldsa_priv:
+            out.load_text("No -----BEGIN ML-DSA-65 PRIVATE KEY----- block found in file.\nPrivate key is only present if you saved the full keygen output.")
+            return self.set_status("ML-DSA-65 private key not found in file.", ok=False)
+
+        # Export PGP keys
+        pgp_pub = gpg.export_keys(pgp_id, armor=True)
+        if not pgp_pub:
+            out.load_text(f"No public key found for: {pgp_id}")
+            return self.set_status(f"PGP key not found: {pgp_id}", ok=False)
+
+        # Get fingerprint
+        keys = gpg.list_keys(keys=pgp_id)
+        fpr = keys[0]["fingerprint"] if keys else pgp_id
+        uids = keys[0]["uids"][0] if keys and keys[0]["uids"] else pgp_id
+
+        if mode == "pub":
+            pub_bundle = (
+                f"-----BEGIN PGP+ML-DSA-65 SIGNING KEY BUNDLE-----\n"
+                f"PGP-Fingerprint: {fpr}\n"
+                f"Identity: {uids}\n\n"
+                f"{pgp_pub.strip()}\n\n"
+                f"{mldsa_pub}\n"
+                f"-----END PGP+ML-DSA-65 SIGNING KEY BUNDLE-----"
+            )
+            result = (
+                f"=== PUBLIC BUNDLE (paste this into Deadman) ===\n\n"
+                f"{pub_bundle}\n\n"
+                f"=== PGP COMPONENT ===\n\n{pgp_pub}\n\n"
+                f"=== ML-DSA-65 PUBLIC KEY ===\n\n{mldsa_pub}"
+            )
+            out.load_text(result)
+            self.set_status("Public bundle dumped.")
+
+        elif mode == "priv":
+            if pp is None:
+                out.load_text("Passphrase required for PGP secret key export.")
+                return self.set_status("Enter passphrase for PGP secret key.", ok=False)
+            pgp_sec = gpg.export_keys(pgp_id, secret=True, armor=True, passphrase=pp)
+            if not pgp_sec:
+                out.load_text(f"PGP secret key export failed for: {pgp_id} (wrong passphrase?)")
+                return self.set_status("PGP secret key export failed.", ok=False)
+            result = (
+                f"=== PRIVATE COMPONENTS — DO NOT SHARE ===\n\n"
+                f"PGP-Fingerprint: {fpr}\n"
+                f"Identity: {uids}\n\n"
+                f"--- PGP SECRET KEY ---\n\n{pgp_sec}\n\n"
+                f"--- ML-DSA-65 PRIVATE KEY ---\n\n{mldsa_priv}"
+            )
+            out.load_text(result)
+            self.set_status("Private bundle dumped — handle with care!")
+
+        elif mode == "full":
+            if pp is None:
+                out.load_text("Passphrase required for PGP secret key export.")
+                return self.set_status("Enter passphrase for PGP secret key.", ok=False)
+            pgp_sec = gpg.export_keys(pgp_id, secret=True, armor=True, passphrase=pp)
+            if not pgp_sec:
+                out.load_text(f"PGP secret key export failed for: {pgp_id} (wrong passphrase?)")
+                return self.set_status("PGP secret key export failed.", ok=False)
+            pub_bundle = (
+                f"-----BEGIN PGP+ML-DSA-65 SIGNING KEY BUNDLE-----\n"
+                f"PGP-Fingerprint: {fpr}\n"
+                f"Identity: {uids}\n\n"
+                f"{pgp_pub.strip()}\n\n"
+                f"{mldsa_pub}\n"
+                f"-----END PGP+ML-DSA-65 SIGNING KEY BUNDLE-----"
+            )
+            result = (
+                f"=== PUBLIC BUNDLE (paste into Deadman) ===\n\n"
+                f"{pub_bundle}\n\n"
+                f"{'='*60}\n"
+                f"=== PGP PUBLIC KEY ===\n\n{pgp_pub}\n\n"
+                f"=== ML-DSA-65 PUBLIC KEY ===\n\n{mldsa_pub}\n\n"
+                f"{'='*60}\n"
+                f"=== PRIVATE COMPONENTS — DO NOT SHARE ===\n\n"
+                f"--- PGP SECRET KEY ---\n\n{pgp_sec}\n\n"
+                f"--- ML-DSA-65 PRIVATE KEY ---\n\n{mldsa_priv}"
+            )
+            out.load_text(result)
+            self.set_status("Full bundle dumped — CONTAINS PRIVATE KEYS.")
+
+    @on(Button.Pressed, "#btn-bundle-pub")
+    def do_bundle_pub(self):
+        self._do_bundle_dump("pub")
+
+    @on(Button.Pressed, "#btn-bundle-priv")
+    def do_bundle_priv(self):
+        self._do_bundle_dump("priv")
+
+    @on(Button.Pressed, "#btn-bundle-full")
+    def do_bundle_full(self):
+        self._do_bundle_dump("full")
+
 
     @on(Button.Pressed, "#btn-enc-clr")
     def enc_clear(self):
         self.query_one("#enc-in",  TextArea).load_text("")
         self.query_one("#enc-out", TextArea).load_text("")
+        self.query_one("#enc-pass", Input).value = ""
         self.set_status("Cleared.")
 
     @on(Button.Pressed, "#btn-dec-clr")
@@ -1507,6 +2011,80 @@ class PGPsus(App):
     @on(Button.Pressed, "#btn-keys-refresh")
     def keys_refresh(self):
         self._refresh_all_key_selects()
+
+    # -- Deadman Storage handlers ----------------------------------------------
+    @on(Button.Pressed, "#btn-dm-gen")
+    def dm_generate(self):
+        entropy  = secrets.token_bytes(32)
+        mnemonic = _dm_entropy_to_mnemonic(entropy)
+        self.query_one("#dm-mnemonic", TextArea).load_text(mnemonic)
+        self.query_one("#dm-out", TextArea).load_text(
+            "Mnemonic generated.\n"
+            "Write it down — it is never stored anywhere.\n"
+            "Click 'Create Vault' to register it on the gateway."
+        )
+        self.set_status("Mnemonic generated.")
+
+    @on(Button.Pressed, "#btn-dm-create")
+    def dm_create(self):
+        out      = self.query_one("#dm-out", TextArea)
+        mnemonic = self.query_one("#dm-mnemonic", TextArea).text.strip()
+        gateway  = self.query_one("#dm-gateway", Input).value.strip()
+        proxy    = self.query_one("#dm-proxy", Input).value.strip()
+        gpg_fp   = self.query_one("#dm-gpg-key", Select).value
+
+        if not mnemonic:
+            out.load_text("Generate a mnemonic first.")
+            return self.set_status("No mnemonic.", ok=False)
+        if not gpg_fp:
+            out.load_text("Select a GPG key to register with the vault.")
+            return self.set_status("No GPG key selected.", ok=False)
+
+        try:
+            dk       = _dm_derive(mnemonic)
+            pgp_pub  = gpg.export_keys(gpg_fp, armor=True)
+            if not pgp_pub:
+                raise ValueError(f"Could not export GPG key: {gpg_fp}")
+
+            out.load_text("Connecting via Tor… (may take 10–20s)")
+            self.refresh()
+
+            result = _dm_http_post(
+                "/v1/vault/create",
+                {"vault_id": dk["vault_id"],
+                 "switch_verifier": dk["switch_verifier"],
+                 "key_type": "pgp",
+                 "pgp_pubkey": pgp_pub,
+                 "mldsa_pubkey": ""},
+                gateway, proxy,
+            )
+
+            if result.get("status") == "created":
+                host = gateway.replace("http://", "").rstrip("/")
+                panel_url = f"http://{host}/panel/"
+                out.load_text(
+                    f"✓ Vault created\n\n"
+                    f"Vault ID:  {dk['vault_id']}\n"
+                    f"Panel URL: {panel_url}\n\n"
+                    f"Mnemonic is in the field above — write it down.\n"
+                    f"GPG key:   {gpg_fp}\n\n"
+                    f"To access: open {panel_url} in Tor Browser\n"
+                    f"and enter your vault ID."
+                )
+                self.set_status("Vault created.")
+            else:
+                out.load_text(f"Gateway error:\n{json.dumps(result, indent=2)}")
+                self.set_status("Vault creation failed.", ok=False)
+
+        except Exception as exc:
+            out.load_text(f"Error: {exc}")
+            self.set_status(f"Error: {exc}", ok=False)
+
+    @on(Button.Pressed, "#btn-dm-clr")
+    def dm_clear(self):
+        self.query_one("#dm-mnemonic", TextArea).load_text("")
+        self.query_one("#dm-out",      TextArea).load_text("")
+        self.set_status("Cleared.")
 
 
 if __name__ == "__main__":
